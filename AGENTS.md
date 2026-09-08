@@ -1,0 +1,14 @@
+# BitMatch project guidance
+
+## Platform scope
+
+macOS, iPad, and iPhone are core product targets. New features and UI improvements should generally work on all three. The `BitMatch-iPad` target supports both iPhone and iPad despite its name.
+
+- Plan the source selection, destinations, verification, queue, recovery, history, and reporting workflow across all three platforms before implementing changes.
+- Share transfer logic, safety rules, state, and presentation models where practical. Adapt layout and navigation to each platform.
+- Design for a narrow iPhone screen, iPad multitasking widths, and resizable Mac windows. Essential information and actions must work with touch and without hover.
+- Respect iOS file-access and background-execution constraints. Explain actual limitations and preserve recoverable state; do not promise unattended work the platform cannot support.
+- Existing Mac-only capabilities, such as SFTP uploads, are explicit exceptions. Do not silently make a new core workflow Mac-only.
+- Validate shared changes with the Mac tests and iOS build as appropriate. For UI changes, check iPhone and iPad layouts as well as Mac; distinguish simulator/build validation from physical-device testing.
+
+Keep the product simple on every platform: choose a source, choose backups, copy and verify, review the outcome.
