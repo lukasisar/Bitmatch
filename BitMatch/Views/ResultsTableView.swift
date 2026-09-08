@@ -69,6 +69,7 @@ struct ResultsTableView: View {
                         .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
                 )
         )
+        .clipShape(RoundedRectangle(cornerRadius: 12))
         .frame(maxHeight: completionPresentation == nil ? 600 : nil)
         .background(widthReader)
     }
