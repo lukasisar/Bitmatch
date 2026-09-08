@@ -140,7 +140,7 @@ bash test.sh ipad-test      # requires IOS_SIMULATOR_DESTINATION
 bash test.sh release-builds # macOS and iPad Release builds
 ```
 
-CI runs `mac-test` and `ipad-build` on pushes and pull requests.
+The CI workflow is included, but GitHub Actions is currently disabled. Run `mac-test` and `ipad-build` locally before submitting changes.
 
 ## FAQ
 
