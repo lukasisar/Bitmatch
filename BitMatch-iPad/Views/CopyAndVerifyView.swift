@@ -451,23 +451,44 @@ private struct MobileProjectSetupCard: View {
 
 struct CopyAndVerifyHeaderView: View {
     var body: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Image(systemName: "doc.on.doc")
-                    .font(.system(size: 24))
-                    .foregroundColor(.green)
-                
-                Text("COPY & VERIFY")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundColor(.white)
-                
-                Spacer()
-            }
-            
-            Text("Copy files to backup destinations with integrity verification")
-                .font(.system(size: 14))
-                .foregroundColor(.white.opacity(0.7))
-                .multilineTextAlignment(.leading)
+        MobileWorkflowHeader(
+            title: "Copy & verify",
+            detail: "Copy a card or folder to your backups.",
+            symbol: "doc.on.doc",
+            tint: .green
+        )
+    }
+}
+
+/// A consistent, compact heading for each mobile workspace.
+struct MobileWorkflowHeader: View {
+    let title: String
+    let detail: String
+    let symbol: String
+    let tint: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label(title, systemImage: symbol)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.white)
+                .labelStyle(MobileWorkflowLabelStyle(tint: tint))
+                .accessibilityAddTraits(.isHeader)
+            Text(detail)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct MobileWorkflowLabelStyle: LabelStyle {
+    let tint: Color
+    func makeBody(configuration: Configuration) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            configuration.icon.foregroundStyle(tint)
+            configuration.title
         }
     }
 }
@@ -587,9 +608,8 @@ struct ProfessionalSourceCard: View {
             // Header
             HStack {
                 Text("Source")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.6))
-                    .tracking(1.0)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.secondary)
                 
                 Spacer()
                 
@@ -714,9 +734,8 @@ struct DestinationsFlowView: View {
             // Header
             VStack(alignment: .leading, spacing: 4) {
                 Text("Backups")
-                    .font(.system(size: 9, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.5))
-                    .tracking(1.2)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundColor(.secondary)
                 
                 if !coordinator.destinationURLs.isEmpty {
                     Text("\(coordinator.destinationURLs.count) selected")

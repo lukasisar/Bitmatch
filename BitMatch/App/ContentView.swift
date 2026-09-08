@@ -35,17 +35,14 @@ struct ContentView: View {
         // Add content height based on current mode
         switch coordinator.currentMode {
         case .copyAndVerify:
-            // Dynamic height based on number of destinations
-            let baseSourceDestinationHeight: CGFloat = 180
-            let additionalDestinationHeight: CGFloat = 50 // Height per additional destination
+            // Allow room for the source row, backup grid, and primary action.
+            // Backup rows grow in pairs at the default compact window width.
             let destinationCount = coordinator.fileSelectionViewModel.destinationURLs.count
-            let extraHeight = destinationCount > 1 ? CGFloat(destinationCount - 1) * additionalDestinationHeight : 0
-            
-            let sourceDestinationHeight = baseSourceDestinationHeight + extraHeight
-            let controlPanelBaseHeight: CGFloat = 120  // Base control panel
-            
-            totalHeight += sourceDestinationHeight + controlPanelBaseHeight
-            
+            let hasSource = coordinator.fileSelectionViewModel.sourceURL != nil
+            let extraRows = max(0, (destinationCount + 1) / 2 - 1)
+            let locationsHeight: CGFloat = hasSource ? 320 + CGFloat(extraRows) * 84 : 230
+            totalHeight += locationsHeight + 200
+
             if transferOptionsExpanded { totalHeight += 330 }
             
         case .compareFolders:

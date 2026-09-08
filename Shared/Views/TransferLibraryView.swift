@@ -65,6 +65,9 @@ struct TransferLibraryView: View {
                 }.padding()
             }
             .navigationTitle("Transfers")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar { ToolbarItem(placement: .confirmationAction) { Button("Done") { dismiss() } } }
             .sheet(isPresented: $showAddTransfer) { AddQueuedTransferView(coordinator: coordinator) }
             .fileExporter(isPresented: $showExport, document: exportDocument, contentType: exportType,
@@ -194,6 +197,9 @@ private struct AddQueuedTransferView: View {
             }
             .formStyle(.grouped)
             .navigationTitle("Add transfer")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) { Button("Cancel") { dismiss() } }
                 ToolbarItem(placement: .confirmationAction) {

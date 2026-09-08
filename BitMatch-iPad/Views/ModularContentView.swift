@@ -244,24 +244,12 @@ struct CompareFoldersView: View {
 
 struct CompareFoldersHeaderView: View {
     var body: some View {
-        VStack(spacing: 8) {
-            HStack {
-                Image(systemName: "folder.badge.questionmark")
-                    .font(.system(size: 24))
-                    .foregroundColor(.purple)
-                
-                Text("COMPARE FOLDERS")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundColor(.white)
-                
-                Spacer()
-            }
-            
-            Text("Compare two folders to identify differences and verify integrity")
-                .font(.system(size: 14))
-                .foregroundColor(.white.opacity(0.7))
-                .multilineTextAlignment(.leading)
-        }
+        MobileWorkflowHeader(
+            title: "Compare folders",
+            detail: "Check two folders for differences.",
+            symbol: "folder.badge.questionmark",
+            tint: .purple
+        )
     }
 }
 
@@ -712,24 +700,12 @@ struct MasterReportHeaderView: View {
     @Binding var showingVolumeSelector: Bool
     
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Image(systemName: "doc.text.magnifyingglass")
-                    .font(.system(size: 24))
-                    .foregroundColor(.blue)
-                
-                Text("MASTER REPORT")
-                    .font(.system(size: 18, weight: .bold))
-                    .foregroundColor(.white)
-                
-                Spacer()
-            }
-            
-            Text("Scan volumes to discover completed transfers and generate comprehensive reports")
-                .font(.system(size: 14))
-                .foregroundColor(.white.opacity(0.7))
-                .multilineTextAlignment(.leading)
-        }
+        MobileWorkflowHeader(
+            title: "Master report",
+            detail: "Find completed transfers and collect their reports.",
+            symbol: "doc.text.magnifyingglass",
+            tint: .blue
+        )
     }
 }
 

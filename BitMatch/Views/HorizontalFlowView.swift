@@ -21,7 +21,7 @@ struct HorizontalFlowView: View {
 
     var body: some View {
         Group {
-            if presentation == .expanded {
+            if presentation == .expanded && fileSelection.sourceURL == nil {
                 HStack(alignment: .top, spacing: 16) {
                     compactSourceSection
                         .frame(minWidth: 210, idealWidth: 250, maxWidth: 300)
@@ -33,8 +33,6 @@ struct HorizontalFlowView: View {
             } else {
                 VStack(alignment: .leading, spacing: 12) {
                     compactSourceSection
-                    transferDirection(symbol: "arrow.down")
-                        .frame(maxWidth: .infinity)
                     compactDestinationsSection
                 }
             }
@@ -119,6 +117,11 @@ struct HorizontalFlowView: View {
                 .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(.white)
                 .lineLimit(2)
+            Text(sourceURL.path)
+                .font(.system(size: 11))
+                .foregroundColor(.white.opacity(0.6))
+                .lineLimit(1)
+                .truncationMode(.middle)
             if let cam = fileSelection.sourceCameraLabel, !cam.isEmpty {
                 Text(cam)
                     .font(.system(size: 10, weight: .medium))
@@ -266,49 +269,54 @@ struct HorizontalFlowView: View {
                         compactDestinationCard(for: destination, at: index)
                     }
 
-                    // Add more button
-                    if !isOperationActive {
-                        Button {
-                            selectDestinationFolder()
-                        } label: {
-                            HStack(spacing: 8) {
-                                Image(systemName: "plus.circle")
-                                    .font(.system(size: 16))
-                                    .foregroundColor(.white.opacity(0.4))
-
-                                Text("Add backup…")
-                                    .font(.system(size: 9))
-                                    .foregroundColor(.white.opacity(0.4))
-                            }
-                            .frame(maxWidth: .infinity, minHeight: 44)
-                            .background(
-                                RoundedRectangle(cornerRadius: 6)
-                                    .fill(Color.white.opacity(0.03))
-                                    .overlay(
-                                        RoundedRectangle(cornerRadius: 6)
-                                            .stroke(
-                                                isAddButtonTargeted ? Color.green.opacity(0.6) : Color.white.opacity(0.1),
-                                                lineWidth: isAddButtonTargeted ? 2 : 1
-                                            )
-                                    )
-                            )
-                            .onDrop(of: [.fileURL], isTargeted: $isAddButtonTargeted) { providers, location in
-                                handleAddDestinationDrop(providers: providers)
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .frame(minWidth: 120)
-                        .accessibilityLabel("Add backup destination")
-                        .accessibilityHint("Opens a folder picker for another backup")
-                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+                // Add more button
+                if !isOperationActive {
+                    Button {
+                        selectDestinationFolder()
+                    } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "plus.circle")
+                                .font(.system(size: 16))
+                                .foregroundColor(.white.opacity(0.4))
+
+                            Text("Add backup…")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.4))
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 44)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6)
+                                .fill(Color.white.opacity(0.03))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 6)
+                                        .stroke(
+                                            isAddButtonTargeted ? Color.green.opacity(0.6) : Color.white.opacity(0.1),
+                                            lineWidth: isAddButtonTargeted ? 2 : 1
+                                        )
+                                )
+                        )
+                        .onDrop(of: [.fileURL], isTargeted: $isAddButtonTargeted) { providers, location in
+                            handleAddDestinationDrop(providers: providers)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .frame(minWidth: 120)
+                    .accessibilityLabel("Add backup destination")
+                    .accessibilityHint("Opens a folder picker for another backup")
+                }
             }
         }
     }
 
     private var destinationColumns: [GridItem] {
-        [GridItem(.flexible(), spacing: 8)]
+        if fileSelection.sourceURL != nil && fileSelection.destinationURLs.count > 1 && presentation == .expanded {
+            return [GridItem(.flexible(), spacing: 8, alignment: .top),
+                    GridItem(.flexible(), spacing: 8, alignment: .top)]
+        }
+        return [GridItem(.flexible(), spacing: 8)]
     }
 
     @ViewBuilder

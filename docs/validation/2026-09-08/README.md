@@ -26,3 +26,5 @@ The local queue is sequential. It stops on issues and waits for the user to resu
 ASC support creates initial destination inventories. It does not import or extend existing histories. The separate retry option disables new ASC generation while preserving those histories. Generating an inventory reads the destination again and can add substantial time on slow storage.
 
 Physical iPhone/iPad storage, card readers, drive disconnects on a real hub, and interoperability with commercial DIT applications remain untested. Simulator checks do not establish unattended iOS background transfer support; keep BitMatch open.
+
+[Follow-up layout cleanup](layout-cleanup/README.md) records the compact Mac setup and consistent mobile headings, including a narrow iPad window check.
