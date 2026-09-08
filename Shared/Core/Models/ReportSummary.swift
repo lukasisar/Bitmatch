@@ -25,4 +25,5 @@ struct ReportSummary {
     let clientLogoData: Data?
     let companyLogoData: Data?
     let photographyJob: PhotographerReportPayload?
+    var notes: String? = nil
 }

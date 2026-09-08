@@ -2,6 +2,39 @@ import XCTest
 @testable import BitMatch
 
 final class ResultPresentationTests: XCTestCase {
+    func testDestinationSummariesKeepSameNamedBackupsSeparate() {
+        let first = URL(fileURLWithPath: "/Volumes/A/Backup")
+        let second = URL(fileURLWithPath: "/Volumes/B/Backup")
+        let rows = [
+            ResultRow(path: "clip.mov", status: "✅ Verified", size: 10, checksum: "abc", destination: "Backup", destinationPath: first.appendingPathComponent("clip.mov").path),
+            ResultRow(path: "clip.mov", status: "❌ Failed", size: 10, checksum: nil, destination: "Backup", destinationPath: second.appendingPathComponent("clip.mov").path)
+        ]
+        let summaries = DestinationResultSummary.make(rows: rows, destinations: [first, second])
+        XCTAssertEqual(summaries.map(\.id), [first.path, second.path])
+        XCTAssertEqual(summaries.map(\.issueCount), [0, 1])
+        XCTAssertEqual(summaries.map { $0.rows.count }, [1, 1])
+    }
+
+    func testCopiedDestinationDoesNotGetVerifiedSummary() {
+        let row = ResultRow(path: "clip.mov", status: "✅ Copied", size: 10, checksum: nil, destination: "Backup", destinationPath: "/Backup/clip.mov")
+        let summary = DestinationResultSummary.make(rows: [row], destinations: [URL(fileURLWithPath: "/Backup")])[0]
+        XCTAssertTrue(summary.needsAttention)
+        XCTAssertEqual(summary.unverifiedCount, 1)
+        XCTAssertTrue(summary.detail.contains("unverified"))
+    }
+
+    func testDestinationWithoutEvidenceDoesNotClaimSuccess() {
+        let summary = DestinationResultSummary.make(rows: [], destinations: [URL(fileURLWithPath: "/Backup")])[0]
+        XCTAssertEqual(summary.detail, "No file results recorded")
+    }
+
+    func testDestinationMatchingRequiresAPathBoundary() {
+        let row = ResultRow(path: "clip.mov", status: "❌ Failed", size: 0, checksum: nil, destination: "Backup2", destinationPath: "/Backup2/clip.mov")
+        let summaries = DestinationResultSummary.make(rows: [row], destinations: [URL(fileURLWithPath: "/Backup")])
+        XCTAssertTrue(summaries[0].rows.isEmpty)
+        XCTAssertEqual(summaries[1].issueCount, 1)
+    }
+
     func testSidecarFailureMakesIntegritySummaryFail() {
         let rows = [
             row("clip.mov", status: "✅ Verified"),

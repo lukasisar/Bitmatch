@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 import XCTest
 @testable import BitMatch
 
@@ -85,6 +86,91 @@ final class CopyVerifyExecutorIntegrityTests: XCTestCase {
         XCTAssertEqual(harness.terminalInfo?.success, false)
         XCTAssertTrue(harness.terminalInfo?.message.contains("photographer verification is incomplete") == true)
     }
+    func testEmptyAuthoritativeResultsCannotCompleteSuccessfully() async throws {
+        let harness = ExecutorHarness(returnedResults: [], emittedResults: [])
+        _ = try await harness.execute()
+        XCTAssertEqual(harness.terminalInfo?.success, false)
+        XCTAssertEqual(harness.terminalInfo?.message, "No files were verified")
+    }
+
+    func testVerifiedDestinationPublishesASCMHLBeforeSuccessfulCompletion() async throws {
+        let fixture = try ascFixture()
+        let harness = ExecutorHarness(returnedResults: [fixture.result], emittedResults: [],
+            sourceURL: fixture.source, destinationURLs: [fixture.destination], generateASCMHL: true)
+        _ = try await harness.execute()
+        XCTAssertEqual(harness.terminalInfo?.success, true)
+        XCTAssertTrue(harness.terminalInfo?.message.contains("ASC MHL handoff records saved") == true)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.history.appendingPathComponent("ascmhl_chain.xml").path))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.source.appendingPathComponent("ascmhl").path))
+        XCTAssertEqual(harness.completedRows.count, 1)
+        XCTAssertTrue(harness.completedRows[0].isSuccessStatus)
+    }
+
+    func testHandoffFailurePreservesSuccessfulFileRowsAndPhotographerFinalization() async throws {
+        let fixture = try ascFixture()
+        try Data("corrupted".utf8).write(to: fixture.result.destinationURL)
+        var finalizations = 0
+        let harness = ExecutorHarness(returnedResults: [fixture.result], emittedResults: [], lifecycleCompletion: { _ in
+            finalizations += 1
+            return PhotographerFinalizationResult(context: nil, locallySafe: true)
+        }, sourceURL: fixture.source, destinationURLs: [fixture.destination], generateASCMHL: true)
+        _ = try await harness.execute()
+        XCTAssertEqual(finalizations, 1)
+        XCTAssertEqual(harness.terminalInfo?.success, false)
+        XCTAssertTrue(harness.terminalInfo?.message.contains("ASC MHL") == true)
+        XCTAssertEqual(harness.completedRows.count, 1)
+        XCTAssertTrue(harness.completedRows[0].isSuccessStatus)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.history.path))
+    }
+
+    func testFailedCopyDoesNotPublishShortenedASCInventory() async throws {
+        let fixture = try ascFixture()
+        let failure = FileOperationResult(sourceURL: fixture.source.appendingPathComponent("missing.mov"),
+            destinationURL: fixture.result.destinationURL.deletingLastPathComponent().appendingPathComponent("missing.mov"),
+            success: false, error: ExecutorFixtureError.persistence, fileSize: 10, verificationResult: nil, processingTime: 0)
+        let harness = ExecutorHarness(returnedResults: [fixture.result, failure], emittedResults: [],
+            sourceURL: fixture.source, destinationURLs: [fixture.destination], generateASCMHL: true)
+        _ = try await harness.execute()
+        XCTAssertEqual(harness.terminalInfo?.success, false)
+        XCTAssertEqual(harness.completedRows.count, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.history.path))
+    }
+
+    func testQuickModeKeepsFailureAndUnverifiedWarningWithoutASC() async throws {
+        let fixture = try ascFixture()
+        let failure = FileOperationResult(sourceURL: fixture.result.sourceURL, destinationURL: fixture.result.destinationURL,
+            success: false, error: ExecutorFixtureError.persistence, fileSize: 10, verificationResult: nil, processingTime: 0)
+        let harness = ExecutorHarness(returnedResults: [failure], emittedResults: [],
+            sourceURL: fixture.source, destinationURLs: [fixture.destination], verificationMode: .quick, generateASCMHL: true)
+        _ = try await harness.execute()
+        XCTAssertEqual(harness.terminalInfo?.success, false)
+        XCTAssertTrue(harness.terminalInfo?.message.contains("1 issue") == true)
+        XCTAssertTrue(harness.terminalInfo?.message.lowercased().contains("not been checksum verified") == true)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.history.path))
+    }
+
+    private func ascFixture() throws -> (source: URL, destination: URL, history: URL, result: FileOperationResult) {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("executor-asc-\(UUID())")
+        addTeardownBlock { try? fm.removeItem(at: root) }
+        let source = root.appendingPathComponent("card")
+        let destination = root.appendingPathComponent("backup")
+        let copiedRoot = SafetyValidator.resolvedDestinationRoot(source: source, destination: destination, settings: CameraLabelSettings())
+        try fm.createDirectory(at: source, withIntermediateDirectories: true)
+        try fm.createDirectory(at: copiedRoot, withIntermediateDirectories: true)
+        let sourceFile = source.appendingPathComponent("clip.mov")
+        let copyFile = copiedRoot.appendingPathComponent("clip.mov")
+        let bytes = Data("Real bytes for executor handoff verification".utf8)
+        try bytes.write(to: sourceFile)
+        try bytes.write(to: copyFile)
+        let checksum = SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined()
+        let result = FileOperationResult(sourceURL: sourceFile, destinationURL: copyFile, success: true, error: nil,
+            fileSize: Int64(bytes.count), verificationResult: VerificationResult(sourceChecksum: checksum,
+                destinationChecksum: checksum, matches: true, checksumType: .sha256, processingTime: 0,
+                fileSize: Int64(bytes.count)), processingTime: 0)
+        return (source, destination, copiedRoot.appendingPathComponent("ascmhl"), result)
+    }
+
 }
 
 @MainActor
@@ -98,7 +184,11 @@ private final class ExecutorHarness {
     init(
         returnedResults: [FileOperationResult],
         emittedResults: [FileOperationResult],
-        lifecycleCompletion: (@MainActor ([ResultRow]) throws -> PhotographerFinalizationResult)? = nil
+        lifecycleCompletion: (@MainActor ([ResultRow]) throws -> PhotographerFinalizationResult)? = nil,
+        sourceURL: URL = URL(fileURLWithPath: "/source"),
+        destinationURLs: [URL] = [URL(fileURLWithPath: "/destination")],
+        verificationMode: VerificationMode = .standard,
+        generateASCMHL: Bool = false
     ) {
         let fileOperations = ExecutorFileOperationsService(
             returnedResults: returnedResults,
@@ -114,15 +204,16 @@ private final class ExecutorHarness {
         )
         config = CopyVerifyConfig(
             operationId: UUID(),
-            sourceURL: URL(fileURLWithPath: "/source"),
-            destinationURLs: [URL(fileURLWithPath: "/destination")],
-            verificationMode: .standard,
+            sourceURL: sourceURL,
+            destinationURLs: destinationURLs,
+            verificationMode: verificationMode,
             cameraLabelSettings: CameraLabelSettings(),
             reportSettings: ReportPrefs(makeReport: false),
             estimatedFiles: returnedResults.count,
             estimatedBytes: returnedResults.reduce(0) { $0 + $1.fileSize },
             currentMode: .copyAndVerify,
-            photographerReportFinalizer: lifecycleCompletion
+            photographerReportFinalizer: lifecycleCompletion,
+            generateASCMHL: generateASCMHL
         )
     }
 

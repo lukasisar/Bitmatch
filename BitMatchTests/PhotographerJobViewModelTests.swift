@@ -219,6 +219,40 @@ struct PhotographerJobViewModelTests {
         #expect(store.saveCount == 5)
     }
 
+    @Test func handoffFailurePreservesPersistedLocalVerificationEvidence() throws {
+        let store = InMemoryPhotographerJobStore()
+        let viewModel = preparedViewModel(store: store)
+        viewModel.beginIngest(destinationCount: 2)
+        try viewModel.completeIngest(results: verifiedRows(destinationNames: ["Primary", "Secondary"]))
+        let verified = try #require(viewModel.activeCard)
+        let savesBeforeHandoffResult = store.saveCount
+
+        // Delayed copy progress and a failed ASC MHL/report handoff cannot erase the local verdict.
+        viewModel.updateProgressStage(.verifying)
+        viewModel.operationFailed()
+        viewModel.operationFailed() // Shared + native shell may both observe completion.
+
+        #expect(viewModel.activeCard?.localState == .locallySafe)
+        #expect(viewModel.activeCard?.locallySafeAt == verified.locallySafeAt)
+        #expect(viewModel.activeCard?.provenance.confirmedFingerprint == verified.provenance.confirmedFingerprint)
+        #expect(viewModel.activeCard?.verifiedDestinationCount == verified.verifiedDestinationCount)
+        #expect(store.saveCount == savesBeforeHandoffResult)
+        #expect(store.storedJobs.first?.cardIngests.first?.localState == .locallySafe)
+    }
+
+    @Test func unsuccessfulCompletionBeforeLocalFinalizationStillFailsCard() {
+        let viewModel = preparedViewModel(store: InMemoryPhotographerJobStore())
+        viewModel.beginIngest(destinationCount: 2)
+        viewModel.updateProgressStage(.verifying)
+
+        viewModel.operationFailed()
+
+        #expect(viewModel.activeCard?.localState == .issues)
+        #expect(viewModel.activeCard?.locallySafeAt == nil)
+        #expect(viewModel.activeCard?.verifiedDestinationCount == 0)
+        #expect(viewModel.activeCard?.provenance.confirmedFingerprint == nil)
+    }
+
     @Test func completionRequiresConfiguredVerifiedDestinationCount() throws {
         let store = InMemoryPhotographerJobStore()
         let viewModel = preparedViewModel(store: store)

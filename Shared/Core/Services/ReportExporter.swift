@@ -27,6 +27,7 @@ struct EnhancedJSONReport: Codable {
     let verification: Verification
     let results: [JSONReportItem]
     let photographyJob: PhotographerReportPayload?
+    var notes: String? = nil
     
     struct SourceInfo: Codable {
         let path: String
@@ -115,6 +116,28 @@ private struct JSONReport: Codable {
 // MARK: - Report Exporter Service
 final class ReportExporter {
     
+    static func normalizedNotes(_ notes: String) -> String? {
+        let trimmed = notes.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    static func verificationDescription(for prefs: ReportPrefs) -> (method: String, label: String, algorithm: String?, primaryAlgorithm: ChecksumAlgorithm?) {
+        switch prefs.verificationMode {
+        case .quick:
+            return ("size-only", "Size check only — contents not checksum verified", nil, nil)
+        case .standard:
+            return ("checksum", "SHA-256 checksum", "SHA-256", .sha256)
+        case .thorough:
+            return ("checksum", "SHA-256 and MD5 checksums", "SHA-256, MD5", .sha256)
+        case .paranoid:
+            return ("checksum-and-byte-compare", "SHA-256 checksum and byte comparison", "SHA-256", .sha256)
+        case nil:
+            return prefs.verifyWithChecksum
+                ? ("checksum", "\(prefs.checksumAlgorithm.rawValue) Checksum", prefs.checksumAlgorithm.rawValue, prefs.checksumAlgorithm)
+                : ("byte-compare", "Byte-to-Byte Comparison", nil, nil)
+        }
+    }
+
     static func export(mode: AppMode,
                       jobID: UUID,
                       started: Date,
@@ -132,7 +155,8 @@ final class ReportExporter {
         
         let appVersion = (Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String) ?? "1.0"
         let osVersion = ProcessInfo.processInfo.operatingSystemVersionString
-        let method = prefs.verifyWithChecksum ? "\(prefs.checksumAlgorithm.rawValue) Checksum" : "Byte-to-Byte Comparison"
+        let verification = verificationDescription(for: prefs)
+        let method = verification.label
         
         let destinationPaths = destinationURLs.map { $0.path }
         let issues = results.filter { !isMatchStatus($0.status) }
@@ -166,7 +190,8 @@ final class ReportExporter {
             averageSpeed: averageSpeed,
             clientLogoData: nil,
             companyLogoData: nil,
-            photographyJob: photographerPayload
+            photographyJob: photographerPayload,
+            notes: normalizedNotes(prefs.notes)
         )
         
         let shouldGenerateFullReport = generateFullReport && prefs.makeReport
@@ -187,7 +212,7 @@ final class ReportExporter {
                        pdfData: pdfData,
                        results: results,
                        finished: finished,
-                       checksumAlgorithm: prefs.verifyWithChecksum ? prefs.checksumAlgorithm : nil,
+                       checksumAlgorithm: verification.primaryAlgorithm,
                        jobID: jobID,
                        started: started,
                        duration: duration,
@@ -436,7 +461,8 @@ final class ReportExporter {
                                  started: started,
                                  duration: duration,
                                  filesPerSecond: filesPerSecond,
-                                 photographerContext: photographerContext)
+                                 photographerContext: photographerContext,
+                                 prefs: prefs)
             
             // Save enhanced JSON report
             let jsonURL = pdfURL.deletingPathExtension().appendingPathExtension("json").nonConflictingSibling()
@@ -531,7 +557,7 @@ final class ReportExporter {
                                      to: csvURL,
                                      started: started,
                                      duration: duration,
-                                     filesPerSecond: filesPerSecond)
+                                     filesPerSecond: filesPerSecond, prefs: prefs)
                 
                 // Save enhanced JSON report
                 let jsonURL = pdfURL.deletingPathExtension().appendingPathExtension("json")
@@ -576,13 +602,15 @@ final class ReportExporter {
                                           started: Date,
                                           duration: TimeInterval,
                                           filesPerSecond: Double,
-                                          photographerContext: PhotographerReportContext? = nil) throws {
+                                          photographerContext: PhotographerReportContext? = nil,
+                                          prefs: ReportPrefs? = nil) throws {
         let csvContent = try makeEnhancedCSV(
             results: results,
             started: started,
             duration: duration,
             filesPerSecond: filesPerSecond,
-            photographerContext: photographerContext
+            photographerContext: photographerContext,
+            prefs: prefs
         )
         try csvContent.data(using: .utf8)?.write(to: url)
     }
@@ -592,7 +620,8 @@ final class ReportExporter {
         started: Date,
         duration: TimeInterval,
         filesPerSecond: Double,
-        photographerContext: PhotographerReportContext?
+        photographerContext: PhotographerReportContext?,
+        prefs: ReportPrefs? = nil
     ) throws -> String {
         let payload = try photographerContext.map {
             try PhotographerReportPayload.make(context: $0, results: results)
@@ -643,6 +672,12 @@ final class ReportExporter {
             }
         }
         
+        if let prefs {
+            csvContent += csvRow(["Verification", verificationDescription(for: prefs).label])
+            if let notes = normalizedNotes(prefs.notes) {
+                csvContent += csvRow(["Notes", notes])
+            }
+        }
         return csvContent
     }
     
@@ -844,15 +879,16 @@ final class ReportExporter {
                 bottleneck: nil // Could be determined by analyzing speeds
             ),
             verification: EnhancedJSONReport.Verification(
-                method: prefs.verifyWithChecksum ? "checksum" : "byte-compare",
-                algorithm: prefs.verifyWithChecksum ? prefs.checksumAlgorithm.rawValue : nil,
+                method: verificationDescription(for: prefs).method,
+                algorithm: verificationDescription(for: prefs).algorithm,
                 issuesByType: issuesByType,
                 checksumCache: nil // Would need to track cache stats during operation
             ),
             results: results.map { JSONReportItem(from: $0) },
             photographyJob: try photographerContext.map {
                 try PhotographerReportPayload.make(context: $0, results: results, finishedAt: finished)
-            }
+            },
+            notes: normalizedNotes(prefs.notes)
         )
     }
     

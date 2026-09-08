@@ -4,6 +4,7 @@ import SwiftUI
 struct PhoneContentView: View {
     @ObservedObject var coordinator: SharedAppCoordinator
     @State private var showSettings = false
+    @State private var showingTransfers = false
 
     var body: some View {
         NavigationStack {
@@ -19,6 +20,10 @@ struct PhoneContentView: View {
 
                 ScrollView {
                     VStack(spacing: 16) {
+                        if coordinator.transferJournal.records.contains(where: { $0.state == .interrupted }) {
+                            Button("Interrupted transfer — review in Transfers") { showingTransfers = true }
+                                .font(.callout).foregroundStyle(.orange).padding(.horizontal)
+                        }
                         // Tabs
                         AdaptiveModeNavigation(coordinator: coordinator, presentation: .compact)
 
@@ -38,12 +43,20 @@ struct PhoneContentView: View {
                 }
             }
             .toolbar {
+                ToolbarItem(placement: .topBarLeading) {
+                    Button { showingTransfers = true } label: {
+                        Label("Transfers", systemImage: "clock.arrow.circlepath")
+                    }
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button { showSettings = true } label: {
                         Image(systemName: "gear")
                             .foregroundColor(.white.opacity(0.9))
                     }
                 }
+            }
+            .sheet(isPresented: $showingTransfers) {
+                TransferLibraryView(coordinator: coordinator, journal: coordinator.transferJournal)
             }
             .sheet(isPresented: $showSettings) {
                 SettingsSheetView(coordinator: coordinator)
@@ -52,7 +65,16 @@ struct PhoneContentView: View {
         }
     }
 
+    @ViewBuilder
     private var copyAndVerifyStack: some View {
-        CopyAndVerifyView(coordinator: coordinator)
+        if coordinator.isOperationInProgress {
+            OperationProgressView(coordinator: coordinator)
+        } else if case .completed = coordinator.operationState {
+            CompletionSummaryView(coordinator: coordinator)
+        } else if coordinator.operationState == .failed {
+            CompletionSummaryView(coordinator: coordinator)
+        } else {
+            CopyAndVerifyView(coordinator: coordinator)
+        }
     }
 }

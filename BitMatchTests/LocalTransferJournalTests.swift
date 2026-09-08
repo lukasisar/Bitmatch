@@ -1,0 +1,201 @@
+import Foundation
+import Testing
+@testable import BitMatch
+
+@MainActor
+struct LocalTransferJournalTests {
+    private func fixture() throws -> (root: URL, source: URL, destination: URL, journal: URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        let source = root.appendingPathComponent("Card")
+        let destination = root.appendingPathComponent("Backup")
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+        return (root, source, destination, root.appendingPathComponent("journal.json"))
+    }
+
+    @Test func runningAttemptBecomesInterruptedOnRelaunch() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        do {
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        var settings = CameraLabelSettings()
+        settings.label = "A001"
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                     cameraSettings: settings, reportSettings: ReportPrefs(), generateASCMHL: false)
+        settings.label = "A002"
+        try journal.markRunning(id: id)
+        }
+        let restored = LocalTransferJournal(fileURL: f.journal)
+        #expect(restored.records.first?.state == .interrupted)
+        #expect(restored.records.first?.cameraSettings.label == "A001")
+        #expect(restored.records.first?.generateASCMHL == false)
+        #expect(restored.records.first?.results.isEmpty == true)
+
+    }
+
+    @Test func historyPreservesFullResultsAndRejectsFalseSuccess() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let row = ResultRow(path: "DCIM/file.mov", status: "❌ Checksum mismatch", size: 123, checksum: "abc",
+                            destination: "Backup", destinationPath: f.destination.appendingPathComponent("DCIM/file.mov").path)
+        do {
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                     cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        try journal.markRunning(id: id)
+
+        try journal.finish(id: id, results: [row], summary: "Check backup", hadIssues: false)
+        }
+        let restored = LocalTransferJournal(fileURL: f.journal)
+        #expect(restored.records.first?.state == .issues)
+        #expect(restored.records.first?.results.first?.destinationPath == row.destinationPath)
+        #expect(restored.records.first?.results.first?.checksum == "abc")
+        #expect(restored.records.first?.results.first?.id == row.id)
+    }
+
+    @Test func retryKeepsPreviousAttemptAndChecksResources() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                     cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        try journal.markRunning(id: id)
+        try journal.interrupt(id: id, summary: "Disconnected")
+        let retryID = try journal.requeue(id: id)
+        #expect(retryID != id)
+        #expect(journal.records.count == 2)
+        #expect(journal.records.first?.state == .queued)
+        #expect(journal.records.last?.state == .interrupted)
+        let access = try journal.prepareToRun(id: retryID)
+        #expect(access.sourceURL.standardizedFileURL.resolvingSymlinksInPath() == f.source.standardizedFileURL.resolvingSymlinksInPath())
+        access.release()
+        try FileManager.default.removeItem(at: f.destination)
+        #expect(throws: (any Error).self) { try journal.prepareToRun(id: retryID) }
+    }
+
+    @Test func retryCanSkipASCMHLWithoutChangingPreviousAttemptOrDefault() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                     cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs(), generateASCMHL: true)
+        try journal.markRunning(id: id)
+        let row = ResultRow(path: "clip.mov", status: "✅ Verified", size: 1, checksum: "abc", destination: "Backup")
+        try journal.finish(id: id, results: [row], summary: "ASC MHL history already exists", hadIssues: true)
+
+        let copyOnlyRetryID = try journal.requeue(id: id, generateASCMHL: false)
+        let defaultRetryID = try journal.requeue(id: id)
+
+        let original = try #require(journal.records.first { $0.id == id })
+        let copyOnlyRetry = try #require(journal.records.first { $0.id == copyOnlyRetryID })
+        let defaultRetry = try #require(journal.records.first { $0.id == defaultRetryID })
+        #expect(original.generateASCMHL)
+        #expect(original.state == .issues)
+        #expect(original.results.first?.id == row.id)
+        #expect(original.summary == "ASC MHL history already exists")
+        #expect(!copyOnlyRetry.generateASCMHL)
+        #expect(copyOnlyRetry.state == .queued)
+        #expect(copyOnlyRetry.verificationMode == .standard)
+        #expect(copyOnlyRetry.source.bookmark == original.source.bookmark)
+        #expect(copyOnlyRetry.destinations.first?.bookmark == original.destinations.first?.bookmark)
+        #expect(defaultRetry.generateASCMHL)
+        let onDisk = try JSONDecoder().decode([LocalTransferRecord].self, from: Data(contentsOf: f.journal))
+        #expect(onDisk.first(where: { $0.id == copyOnlyRetryID })?.generateASCMHL == false)
+        #expect(onDisk.first(where: { $0.id == id })?.generateASCMHL == true)
+    }
+
+    @Test func projectAttemptCannotBeRetriedAsUntrackedCopy() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                     cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs(), projectID: UUID())
+        try journal.markRunning(id: id)
+        try journal.interrupt(id: id, summary: "Interrupted")
+        #expect(journal.records.first?.canRetry == false)
+        #expect(throws: LocalTransferJournalError.self) { try journal.requeue(id: id) }
+    }
+
+    @Test func corruptHistoryIsNotSilentlyOverwritten() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let original = Data("not valid JSON".utf8)
+        try original.write(to: f.journal)
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        #expect(journal.persistenceError != nil)
+        #expect(throws: LocalTransferJournalError.self) {
+            try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        }
+        #expect(try Data(contentsOf: f.journal) == original)
+        #expect(journal.records.isEmpty)
+    }
+
+    @Test func persistenceFailureDoesNotPublishQueuedWork() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let blockingFile = f.root.appendingPathComponent("not-a-directory")
+        try Data().write(to: blockingFile)
+        let journal = LocalTransferJournal(fileURL: blockingFile.appendingPathComponent("journal.json"))
+        #expect(throws: (any Error).self) {
+            try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        }
+        #expect(journal.records.isEmpty)
+        #expect(journal.persistenceError != nil)
+    }
+
+    @Test func secondInstanceCannotOverwriteLiveHistory() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let first = LocalTransferJournal(fileURL: f.journal)
+        let id = try first.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                                   cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        try first.markRunning(id: id)
+        let second = LocalTransferJournal(fileURL: f.journal)
+        #expect(second.persistenceError?.contains("already open") == true)
+        #expect(throws: LocalTransferJournalError.self) {
+            try second.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .standard,
+                               cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        }
+        let onDisk = try JSONDecoder().decode([LocalTransferRecord].self, from: Data(contentsOf: f.journal))
+        #expect(onDisk.first?.state == .running)
+        #expect(first.records.first?.state == .running)
+    }
+
+    @Test func quickCopyNeverClaimsVerifiedCompletion() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .quick,
+                                     cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        try journal.markRunning(id: id)
+        try journal.finish(id: id, results: [ResultRow(path: "file", status: "✅ Copied", size: 1, checksum: nil, destination: "Backup")],
+                           summary: "Done", hadIssues: false)
+        #expect(journal.records.first?.state == .issues)
+        #expect(journal.records.first?.summary.contains("without checksum verification") == true)
+    }
+
+    @Test func exportedHistoryPreservesUnverifiedVerdictWithoutBookmarks() throws {
+        let f = try fixture()
+        defer { try? FileManager.default.removeItem(at: f.root) }
+        let journal = LocalTransferJournal(fileURL: f.journal)
+        let id = try journal.enqueue(sourceURL: f.source, destinationURLs: [f.destination], verificationMode: .quick,
+                                     cameraSettings: CameraLabelSettings(), reportSettings: ReportPrefs())
+        try journal.markRunning(id: id)
+        try journal.finish(id: id, results: [ResultRow(path: "file", status: "✅ Copied", size: 1, checksum: nil, destination: "Backup")],
+                           summary: "Done", hadIssues: false)
+        let record = try #require(journal.records.first)
+        let csv = try TransferHistoryDocument(record: record, asCSV: true)
+        let csvText = String(decoding: csv.data, as: UTF8.self)
+        #expect(csvText.contains("verification,transfer_state,transfer_summary"))
+        #expect(csvText.contains("\"Quick\",\"issues\""))
+        #expect(csvText.contains("without checksum verification"))
+        let json = try TransferHistoryDocument(record: record, asCSV: false)
+        let payload = try #require(JSONSerialization.jsonObject(with: json.data) as? [String: Any])
+        #expect(payload["state"] as? String == "issues")
+        #expect(payload["source"] as? String == f.source.path)
+        #expect(payload["bookmark"] == nil)
+        #expect(!String(decoding: json.data, as: UTF8.self).contains(record.source.bookmark.base64EncodedString()))
+    }
+}

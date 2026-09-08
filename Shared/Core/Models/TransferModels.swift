@@ -119,6 +119,8 @@ struct ResultRow: Identifiable {
 
 // MARK: - Report Preferences  
 struct ReportPrefs: Codable {
+    /// Actual copy mode; nil preserves legacy folder-comparison preferences.
+    var verificationMode: VerificationMode? = nil
     var generatePDF: Bool = true
     var generateCSV: Bool = true
     var includeThumbnails: Bool = false

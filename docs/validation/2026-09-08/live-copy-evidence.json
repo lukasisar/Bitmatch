@@ -1,0 +1,17 @@
+[
+  {
+    "destination": "Backup A",
+    "independentlyMatchedFiles": 12,
+    "reportsAndMHL": []
+  },
+  {
+    "destination": "Backup B",
+    "independentlyMatchedFiles": 12,
+    "reportsAndMHL": [
+      "Reports/BitMatch_Report_2026-09-08T10-35-35Z.json",
+      "Reports/BitMatch_Report_2026-09-08T10-35-35Z.pdf",
+      "Reports/BitMatch_Report_2026-09-08T10-35-35Z.sha-256.txt",
+      "Reports/BitMatch_Report_2026-09-08T10-35-35Z.csv"
+    ]
+  }
+]

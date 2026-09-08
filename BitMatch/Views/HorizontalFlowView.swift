@@ -13,12 +13,12 @@ struct HorizontalFlowView: View {
     @State private var isSourceTargeted = false
     @State private var isAddDestinationTargeted = false
     @State private var isAddButtonTargeted = false
-    
+
     // Convenience accessors
     private var fileSelection: FileSelectionViewModel { coordinator.fileSelectionViewModel }
     private var progress: ProgressViewModel { coordinator.progressViewModel }
     private var isOperationActive: Bool { coordinator.isOperationInProgress }
-    
+
     var body: some View {
         Group {
             if presentation == .expanded {
@@ -51,11 +51,11 @@ struct HorizontalFlowView: View {
 
     private func transferDirection(symbol: String) -> some View {
         Image(systemName: symbol)
-            .font(.system(size: 13, weight: .semibold))
+            .font(.system(size: 15, weight: .semibold))
             .foregroundColor(.white.opacity(0.34))
             .accessibilityHidden(true)
     }
-    
+
     // MARK: - Compact Source Section
     @ViewBuilder
     private var compactSourceSection: some View {
@@ -67,15 +67,15 @@ struct HorizontalFlowView: View {
             handleSourceDrop(providers: providers)
         }
     }
-    
+
     @ViewBuilder
     private var sourceSectionHeader: some View {
-        Text("1 · SOURCE")
-            .font(.system(size: 9, weight: .semibold))
+        Text("Source")
+            .font(.system(size: 12, weight: .semibold))
             .foregroundColor(.white.opacity(0.5))
-            .tracking(1.2)
+            .tracking(0)
     }
-    
+
     @ViewBuilder
     private var sourceSectionContent: some View {
         if let sourceURL = fileSelection.sourceURL {
@@ -84,7 +84,7 @@ struct HorizontalFlowView: View {
             emptySourceView
         }
     }
-    
+
     @ViewBuilder
     private func selectedSourceView(sourceURL: URL) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -94,7 +94,7 @@ struct HorizontalFlowView: View {
         .padding(12)
         .background(selectedSourceBackground)
     }
-    
+
     @ViewBuilder
     private func sourceInfoRow(sourceURL: URL) -> some View {
         HStack(spacing: 8) {
@@ -104,36 +104,36 @@ struct HorizontalFlowView: View {
             removeSourceButton
         }
     }
-    
+
     @ViewBuilder
     private var sourceFolderIcon: some View {
         Image(systemName: "folder.fill")
             .font(.system(size: 16))
             .foregroundColor(.green)
     }
-    
+
     @ViewBuilder
     private func sourceDetails(sourceURL: URL) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             Text(sourceURL.lastPathComponent)
-                .font(.system(size: 13, weight: .semibold))
+                .font(.system(size: 15, weight: .semibold))
                 .foregroundColor(.white)
-                .lineLimit(1)
+                .lineLimit(2)
             if let cam = fileSelection.sourceCameraLabel, !cam.isEmpty {
                 Text(cam)
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(.green.opacity(0.9))
             }
-            
+
             if let info = fileSelection.sourceFolderInfo {
                 let videoText = fileSelection.sourceVideoFileCount > 0 ? "\(fileSelection.sourceVideoFileCount) videos" : "\(info.formattedFileCount) files"
                 Text("\(videoText) • \(info.formattedSize)")
-                    .font(.system(size: 10))
+                    .font(.system(size: 12))
                     .foregroundColor(.white.opacity(0.6))
             }
         }
     }
-    
+
     @ViewBuilder
     private var removeSourceButton: some View {
         if !isOperationActive {
@@ -150,20 +150,20 @@ struct HorizontalFlowView: View {
             .accessibilityHint("Clears the selected source")
         }
     }
-    
+
     @ViewBuilder
     private var cameraDetectionBadge: some View {
         // Camera type detection not available in current FolderInfo model
         // This feature would need to be implemented through a different mechanism
         EmptyView()
     }
-    
+
     @ViewBuilder
     private var cameraDetectionBackground: some View {
         Capsule()
             .fill(Color.blue.opacity(0.15))
     }
-    
+
     @ViewBuilder
     private var selectedSourceBackground: some View {
         RoundedRectangle(cornerRadius: 8)
@@ -173,7 +173,7 @@ struct HorizontalFlowView: View {
                     .stroke(Color.green.opacity(0.3), lineWidth: 1)
             )
     }
-    
+
     @ViewBuilder
     private var emptySourceView: some View {
         VStack(spacing: 6) {
@@ -182,7 +182,7 @@ struct HorizontalFlowView: View {
                 .foregroundColor(isSourceTargeted ? .green.opacity(0.7) : .white.opacity(0.3))
 
             Text("Drag source folder here")
-                .font(.system(size: 11, weight: .medium))
+                .font(.system(size: 13, weight: .medium))
                 .foregroundColor(isSourceTargeted ? .green.opacity(0.8) : .white.opacity(0.5))
 
             Text("or")
@@ -193,11 +193,11 @@ struct HorizontalFlowView: View {
                 selectSourceFolder()
             }
             .buttonStyle(CustomButtonStyle())
-            .scaleEffect(0.9)
+
             .accessibilityLabel("Choose source folder")
             .accessibilityHint("Opens a folder picker for the source")
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, minHeight: 130)
         .background(
             RoundedRectangle(cornerRadius: 8)
                 .fill(Color.white.opacity(0.03))
@@ -211,16 +211,16 @@ struct HorizontalFlowView: View {
         )
         .animation(.easeInOut(duration: 0.2), value: isSourceTargeted)
     }
-    
-    // MARK: - Compact Destinations Section  
+
+    // MARK: - Compact Destinations Section
     @ViewBuilder
     private var compactDestinationsSection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("2 · BACKUP DESTINATIONS")
-                .font(.system(size: 9, weight: .semibold))
+            Text("Backups")
+                .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(.white.opacity(0.5))
-                .tracking(1.2)
-            
+                .tracking(0)
+
             if fileSelection.destinationURLs.isEmpty {
                 // Empty state
                 VStack(spacing: 6) {
@@ -229,7 +229,7 @@ struct HorizontalFlowView: View {
                         .foregroundColor(isAddDestinationTargeted ? .green.opacity(0.7) : .white.opacity(0.3))
 
                     Text("Drag backup folders or drives here")
-                        .font(.system(size: 11, weight: .medium))
+                        .font(.system(size: 13, weight: .medium))
                         .foregroundColor(isAddDestinationTargeted ? .green.opacity(0.8) : .white.opacity(0.5))
 
                     Text("or")
@@ -240,11 +240,11 @@ struct HorizontalFlowView: View {
                         selectDestinationFolder()
                     }
                     .buttonStyle(CustomButtonStyle())
-                    .scaleEffect(0.9)
+
                     .accessibilityLabel("Add backup destinations")
                     .accessibilityHint("Opens a folder picker for one or more backups")
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity, minHeight: 130)
                 .background(
                     RoundedRectangle(cornerRadius: 8)
                         .fill(Color.white.opacity(0.03))
@@ -265,22 +265,22 @@ struct HorizontalFlowView: View {
                     ForEach(Array(fileSelection.destinationURLs.enumerated()), id: \.element) { index, destination in
                         compactDestinationCard(for: destination, at: index)
                     }
-                    
+
                     // Add more button
                     if !isOperationActive {
                         Button {
                             selectDestinationFolder()
                         } label: {
-                            VStack(spacing: 4) {
+                            HStack(spacing: 8) {
                                 Image(systemName: "plus.circle")
                                     .font(.system(size: 16))
                                     .foregroundColor(.white.opacity(0.4))
-                                
-                                Text("Add")
+
+                                Text("Add backup…")
                                     .font(.system(size: 9))
                                     .foregroundColor(.white.opacity(0.4))
                             }
-                            .frame(maxWidth: .infinity, minHeight: 70)
+                            .frame(maxWidth: .infinity, minHeight: 44)
                             .background(
                                 RoundedRectangle(cornerRadius: 6)
                                     .fill(Color.white.opacity(0.03))
@@ -308,74 +308,50 @@ struct HorizontalFlowView: View {
     }
 
     private var destinationColumns: [GridItem] {
-        [GridItem(.adaptive(minimum: presentation == .expanded ? 132 : 150), spacing: 8)]
+        [GridItem(.flexible(), spacing: 8)]
     }
-    
+
     @ViewBuilder
     private func compactDestinationCard(for url: URL, at index: Int) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Image(systemName: "externaldrive.fill")
-                    .font(.system(size: 12))
-                    .foregroundColor(.blue)
-                
+        HStack(spacing: 12) {
+            Image(systemName: "externaldrive.fill")
+                .font(.system(size: 20))
+                .foregroundColor(.blue)
+            VStack(alignment: .leading, spacing: 4) {
                 Text(url.lastPathComponent)
-                    .font(.system(size: 11, weight: .medium))
+                    .font(.system(size: 15, weight: .semibold))
                     .foregroundColor(.white)
+                    .lineLimit(2)
+                    .truncationMode(.middle)
+                Text(url.path)
+                    .font(.system(size: 11))
+                    .foregroundColor(.white.opacity(0.65))
                     .lineLimit(1)
                     .truncationMode(.middle)
-                    .help(url.path)
-                
-                Spacer()
-                
-                if !isOperationActive {
-                    Button {
-                        fileSelection.removeDestination(url)
-                        refreshID = UUID()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 10))
-                            .foregroundColor(.red.opacity(0.6))
-                    }
-                    .buttonStyle(.plain)
-                    .accessibilityLabel("Remove backup \(url.lastPathComponent)")
-                    .accessibilityHint("Removes this backup destination")
+                if let free = fileSelection.formattedAvailableSpace(for: url) {
+                    Text("\(free) available")
+                        .font(.system(size: 12))
+                        .foregroundColor(.white.opacity(0.75))
                 }
             }
-            
-            // Drive speed and priority info
-            let driveSpeed = fileSelection.detectDriveSpeed(for: url)
-            let priority = getFastLanePriority(for: url, at: index)
-            
-            HStack(spacing: 4) {
-                HStack(spacing: 2) {
-                    Image(systemName: driveSpeed.icon)
-                        .font(.system(size: 7))
-                    Text(driveSpeed.rawValue)
-                        .font(.system(size: 8))
+            .frame(maxWidth: .infinity, alignment: .leading)
+            if !isOperationActive {
+                Button {
+                    fileSelection.removeDestination(url)
+                    refreshID = UUID()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 16))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(width: 32, height: 32)
                 }
-                .foregroundColor(driveSpeed.color)
-                
-                if let priorityInfo = priority {
-                    Text("•")
-                        .font(.system(size: 6))
-                        .foregroundColor(.white.opacity(0.3))
-                    
-                    Text(priorityInfo.label)
-                        .font(.system(size: 7, weight: .medium))
-                        .foregroundColor(priorityInfo.color)
-                }
-            }
-
-            // Available free space
-            if let free = fileSelection.formattedAvailableSpace(for: url) {
-                Text("Free: \(free)")
-                    .font(.system(size: 8))
-                    .foregroundColor(.white.opacity(0.6))
+                .buttonStyle(.plain)
+                .accessibilityLabel("Remove backup \(url.lastPathComponent)")
             }
         }
-        .padding(8)
-        .frame(width: 120, height: 70)
+        .padding(12)
+        .frame(maxWidth: .infinity, minHeight: 76, alignment: .leading)
+        .help(url.path)
         .background(
             RoundedRectangle(cornerRadius: 6)
                 .fill(Color.white.opacity(0.05))
@@ -397,7 +373,7 @@ struct HorizontalFlowView: View {
         .scaleEffect(dragHoveredIndex == index ? 1.05 : 1.0)
         .animation(.spring(response: 0.3), value: dragHoveredIndex)
     }
-    
+
     // MARK: - Drag & Drop Handling
     private func handleDestinationDrop(providers: [NSItemProvider], targetIndex: Int) -> Bool {
         guard !isOperationActive else { return false }
@@ -411,7 +387,7 @@ struct HorizontalFlowView: View {
         }
         return true
     }
-    
+
     private func handleSourceDrop(providers: [NSItemProvider]) -> Bool {
         guard !isOperationActive else { return false }
         loadDroppedDirectories(providers: providers, allowMultiple: false) { urls in
@@ -420,7 +396,7 @@ struct HorizontalFlowView: View {
         }
         return true
     }
-    
+
     private func handleAddDestinationDrop(providers: [NSItemProvider]) -> Bool {
         guard !isOperationActive else { return false }
         loadDroppedDirectories(providers: providers, allowMultiple: true) { urls in
@@ -539,59 +515,59 @@ struct HorizontalFlowView: View {
             userInfo: ["reason": reason]
         )
     }
-    
+
     // MARK: - Actions
     private func selectSourceFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.prompt = "Select Source"
-        
+
         if panel.runModal() == .OK, let url = panel.url {
             setSourceURL(url)
         }
     }
-    
+
     private func selectDestinationFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.allowsMultipleSelection = true
         panel.prompt = "Select Destination"
-        
+
         if panel.runModal() == .OK {
             addDestinationURLs(panel.urls)
         }
     }
-    
+
     // MARK: - Helper Methods
-    
+
     private func isDestinationActive(_ index: Int) -> Bool {
         // In a real implementation, this would check if this specific destination is being processed
         return isOperationActive
     }
-    
+
     // MARK: - Fast Lane Priority Helper
-    
+
     struct FastLanePriorityInfo {
         let label: String
         let icon: String
         let color: Color
     }
-    
+
     private func getFastLanePriority(for url: URL, at index: Int) -> FastLanePriorityInfo? {
         // Only show priority indicators when we have multiple destinations
         guard fileSelection.destinationURLs.count > 1 else { return nil }
-        
+
         // Get all destination speeds to determine ranking
         let destinationsWithSpeeds = fileSelection.destinationURLs.map { dest in
             (url: dest, speed: fileSelection.detectDriveSpeed(for: dest))
         }
         let sortedBySpeed = destinationsWithSpeeds.sorted { $0.speed.estimatedSpeed > $1.speed.estimatedSpeed }
-        
+
         // Find this URL's position in the speed ranking
         guard let urlIndex = sortedBySpeed.firstIndex(where: { $0.url == url }) else { return nil }
-        
+
         switch urlIndex {
         case 0:
             return FastLanePriorityInfo(label: "PRIORITY", icon: "bolt.fill", color: .green)

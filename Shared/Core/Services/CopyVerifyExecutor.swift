@@ -24,6 +24,7 @@ struct CopyVerifyConfig {
     let estimatedBytes: Int64
     let currentMode: AppMode
     let photographerReportFinalizer: PhotographerReportFinalizer?
+    let generateASCMHL: Bool
 
     init(
         operationId: UUID,
@@ -35,7 +36,8 @@ struct CopyVerifyConfig {
         estimatedFiles: Int,
         estimatedBytes: Int64,
         currentMode: AppMode,
-        photographerReportFinalizer: PhotographerReportFinalizer? = nil
+        photographerReportFinalizer: PhotographerReportFinalizer? = nil,
+        generateASCMHL: Bool = false
     ) {
         self.operationId = operationId
         self.sourceURL = sourceURL
@@ -47,6 +49,7 @@ struct CopyVerifyConfig {
         self.estimatedBytes = estimatedBytes
         self.currentMode = currentMode
         self.photographerReportFinalizer = photographerReportFinalizer
+        self.generateASCMHL = generateASCMHL
     }
 }
 
@@ -84,6 +87,7 @@ final class CopyVerifyExecutor {
 
     // MARK: - State
     private let maxResultsInMemory = 5_000
+    private var handoffTask: Task<[String], Error>?
 
     // MARK: - Initialization
 
@@ -252,8 +256,8 @@ final class CopyVerifyExecutor {
         SharedLogger.info("Mapped \(allResults.count) authoritative operation results for report", category: .transfer)
 
         let issueCount = allResults.filter { !$0.isSuccessStatus }.count
-        let fileResultsSucceeded = issueCount == 0
-        let fileResultsMessage = fileResultsSucceeded ?
+        let fileResultsSucceeded = !allResults.isEmpty && issueCount == 0
+        let fileResultsMessage = allResults.isEmpty ? "No files were verified" : fileResultsSucceeded ?
             "Operation completed successfully" :
             "Operation completed with \(issueCount) issue\(issueCount == 1 ? "" : "s")"
 
@@ -264,14 +268,23 @@ final class CopyVerifyExecutor {
                 return try finalizer(allResults)
             }
         )
-        let succeeded = fileResultsSucceeded && photographerLifecycle.permitsSuccessfulCompletion
-        let completionMessage: String
+        let handoffIssues = try await createASCMHLHistories(operation: operation, config: config, callbacks: callbacks)
+        let succeeded = fileResultsSucceeded && photographerLifecycle.permitsSuccessfulCompletion && handoffIssues.isEmpty && config.verificationMode != .quick
+        var completionMessage: String
         if !photographerLifecycle.didPersist {
             completionMessage = "\(fileResultsMessage); photographer lifecycle finalization failed"
         } else if photographerLifecycle.locallySafe == false {
             completionMessage = "\(fileResultsMessage); photographer verification is incomplete"
         } else {
             completionMessage = fileResultsMessage
+        }
+        if !handoffIssues.isEmpty {
+            completionMessage += "; " + handoffIssues.joined(separator: "; ")
+        } else if config.generateASCMHL && config.verificationMode != .quick {
+            completionMessage += "; ASC MHL handoff records saved"
+        }
+        if config.verificationMode == .quick {
+            completionMessage += "; contents have not been checksum verified."
         }
 
         timingService.completeOperation(success: succeeded, message: completionMessage)
@@ -284,7 +297,8 @@ final class CopyVerifyExecutor {
                 operation: operation,
                 results: allResults,
                 config: config,
-                photographerContext: photographerLifecycle.context
+                photographerContext: photographerLifecycle.context,
+                handoffSummary: handoffIssues.isEmpty ? nil : handoffIssues.joined(separator: "; ")
             )
         }
 
@@ -297,6 +311,66 @@ final class CopyVerifyExecutor {
         NotificationCenter.default.post(name: .operationCompleted, object: nil)
 
         return operation
+    }
+
+    private func createASCMHLHistories(operation: FileOperation, config: CopyVerifyConfig,
+                                       callbacks: CopyVerifyCallbacks) async throws -> [String] {
+        guard config.generateASCMHL, config.verificationMode != .quick else { return [] }
+        let expectedPaths = Set(operation.results.map { $0.sourceURL.standardizedFileURL.path })
+        var jobs: [(URL, [ASCMHLGenerator.VerifiedFile])] = []
+        var issues: [String] = []
+        for destination in config.destinationURLs {
+            let root: URL
+            do {
+                root = try SafetyValidator.resolvedDestinationRootChecked(
+                    source: config.sourceURL, destination: destination, settings: config.cameraLabelSettings
+                )
+            } catch {
+                issues.append("\(destination.lastPathComponent): ASC MHL not created — \(error.localizedDescription)")
+                continue
+            }
+            let canonicalRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+            let rows = operation.results.filter { canonicalRoot.isAncestor(of: $0.destinationURL.standardizedFileURL.resolvingSymlinksInPath()) }
+            guard !expectedPaths.isEmpty, rows.count == expectedPaths.count,
+                  Set(rows.map { $0.sourceURL.standardizedFileURL.path }) == expectedPaths,
+                  rows.allSatisfy({ $0.success && $0.verificationResult?.isValid == true && $0.verificationResult?.checksumType == .sha256 }) else {
+                issues.append("\(destination.lastPathComponent): ASC MHL not created because verification is incomplete")
+                continue
+            }
+            jobs.append((root, rows.map {
+                ASCMHLGenerator.VerifiedFile(
+                    relativePath: $0.destinationURL.standardizedFileURL.resolvingSymlinksInPath().relativePath(to: canonicalRoot),
+                    size: $0.fileSize, expectedSHA256: $0.verificationResult?.sourceChecksum ?? ""
+                )
+            }))
+        }
+        callbacks.onStateChange(.verifying)
+        timingService.updateStage(.verifying)
+        stateService.updateCapabilities(canPause: false, canResume: false)
+        callbacks.onProgress(OperationProgress(
+            overallProgress: 1, currentFile: "Creating ASC MHL handoff records…",
+            filesProcessed: operation.results.count, totalFiles: operation.results.count,
+            currentStage: .verifying, speed: nil, timeRemaining: nil
+        ))
+        let sourceURL = config.sourceURL
+        let startTime = operation.startTime
+        let work = Task.detached(priority: .utility) { [jobs, issues] () throws -> [String] in
+            var failures = issues
+            for (root, files) in jobs {
+                try Task.checkCancellation()
+                do {
+                    _ = try ASCMHLGenerator.generateInitialHistory(destinationURL: root, files: files, startTime: startTime, sourceURL: sourceURL)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    failures.append("\(root.lastPathComponent): ASC MHL — \(error.localizedDescription)")
+                }
+            }
+            return failures
+        }
+        handoffTask = work
+        defer { handoffTask = nil }
+        return try await withTaskCancellationHandler(operation: { try await work.value }, onCancel: { work.cancel() })
     }
 
     private func handleError(
@@ -331,7 +405,8 @@ final class CopyVerifyExecutor {
         operation: FileOperation,
         results: [ResultRow],
         config: CopyVerifyConfig,
-        photographerContext: PhotographerReportContext?
+        photographerContext: PhotographerReportContext?,
+        handoffSummary: String? = nil
     ) async {
         let matchCount = results.filter { $0.isSuccessStatus }.count
         let totalBytesProcessed = config.estimatedBytes
@@ -341,12 +416,14 @@ final class CopyVerifyExecutor {
         SharedLogger.info("Auto-report queued for job \(operation.id) with \(fileCount) rows", category: .transfer)
 
         let reportMode = config.currentMode
-        let reportSettings = config.reportSettings
+        var reportSettings = config.reportSettings
+        reportSettings.verificationMode = config.verificationMode
+        if let handoffSummary { reportSettings.notes += "\nASC MHL: \(handoffSummary)" }
         let reportResults = results
         let reportOperation = operation
         let reportContext = photographerContext
 
-        Task.detached(priority: .utility) {
+        await Task.detached(priority: .utility) {
             await ReportExporter.export(
                 mode: reportMode,
                 jobID: reportOperation.id,
@@ -363,7 +440,7 @@ final class CopyVerifyExecutor {
                 generateFullReport: reportSettings.makeReport,
                 photographerContext: reportContext
             )
-        }
+        }.value
     }
 
     static func photographerLifecycleAfterAuthoritativeCompletion(
@@ -403,6 +480,7 @@ final class CopyVerifyExecutor {
 
     /// Cancel the current operation
     func cancel() {
+        handoffTask?.cancel()
         platformManager.fileOperations.cancelOperation()
         timingService.cancelOperation()
     }

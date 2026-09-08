@@ -90,6 +90,14 @@ struct ReportView: View {
             // Summary Section
             summarySection
 
+            if let notes = s.notes, !notes.isEmpty {
+                Divider().padding(.vertical, 12)
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("Notes & handoff issues").font(.headline)
+                    Text(notes).font(.body).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
             if s.photographyJob != nil {
                 Divider().padding(.vertical, 12)
                 photographyJobSection

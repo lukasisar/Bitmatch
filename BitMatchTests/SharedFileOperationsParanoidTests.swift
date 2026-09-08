@@ -43,9 +43,27 @@ struct SharedFileOperationsParanoidTests {
             #expect(op.results.count >= 2)
             let verifiedCount = op.results.filter { $0.verificationResult?.isValid == true }.count
             #expect(verifiedCount >= 2)
-            // Paranoid mode now emits a real SHA-256 digest (used for MHL),
+            // Paranoid mode emits a real SHA-256 digest for the ASC handoff,
             // not a "byte-comparison" placeholder.
             #expect(op.results.allSatisfy { ($0.verificationResult?.sourceChecksum.count ?? 0) == 64 })
+
+            // The engine must not leave proprietary MHL companions that an ASC
+            // whole-folder verifier would classify as untracked extra files.
+            let copiedRoot = SafetyValidator.resolvedDestinationRoot(
+                source: source, destination: dest, settings: CameraLabelSettings())
+            let contents = try fm.contentsOfDirectory(at: copiedRoot, includingPropertiesForKeys: nil)
+            #expect(Set(contents.map(\.lastPathComponent)) == Set(["alpha.txt", "beta.txt"]))
+            let history = try ASCMHLGenerator.generateInitialHistory(
+                destinationURL: copiedRoot,
+                files: op.results.map {
+                    ASCMHLGenerator.VerifiedFile(
+                        relativePath: $0.destinationURL.relativePath(to: copiedRoot),
+                        size: $0.fileSize,
+                        expectedSHA256: $0.verificationResult?.sourceChecksum ?? "")
+                }, startTime: op.startTime, sourceURL: source)
+            #expect(fm.fileExists(atPath: history.path))
+            #expect(fm.fileExists(atPath: copiedRoot.appendingPathComponent("ascmhl/ascmhl_chain.xml").path))
+            #expect(!fm.fileExists(atPath: source.appendingPathComponent("ascmhl").path))
 
             // Cleanup
             try? fm.removeItem(at: source)

@@ -22,8 +22,41 @@ struct CompletionSummaryView: View {
             // Completion status header
             CompletionStatusHeaderView(coordinator: coordinator, verdict: verdict)
             
-            // Operation summary stats
-            OperationSummaryStatsView(coordinator: coordinator)
+            VStack(alignment: .leading, spacing: 14) {
+                ForEach(DestinationResultSummary.make(rows: coordinator.results, destinations: coordinator.destinationURLs)) { summary in
+                    HStack(alignment: .top, spacing: 10) {
+                        Image(systemName: summary.needsAttention ? "exclamationmark.triangle" : "checkmark.circle")
+                            .foregroundColor(summary.needsAttention ? .orange : .green)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(summary.title).font(.headline)
+                            Text(summary.detail).font(.subheadline).foregroundColor(.secondary)
+                        }
+                        Spacer(minLength: 0)
+                    }
+                }
+                DisclosureGroup("File details") {
+                    LazyVStack(alignment: .leading, spacing: 12) {
+                        ForEach(ResultPresentation.visibleRows(coordinator.results, issuesOnly: false, limit: 1_000)) { row in
+                            VStack(alignment: .leading, spacing: 3) {
+                                Text(row.fileName).font(.subheadline).lineLimit(2)
+                                Text([row.destination, row.status].compactMap { $0 }.joined(separator: " · "))
+                                    .font(.footnote)
+                                    .foregroundColor(row.isSuccessStatus ? Color.secondary : Color.orange)
+                            }
+                        }
+                        if coordinator.results.count > 1_000 {
+                            Text("Showing 1,000 retained results. Export a report for the full record.")
+                                .font(.footnote).foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(.top, 12)
+                }
+                .padding(.vertical, 8)
+                DisclosureGroup("Transfer details") {
+                    OperationSummaryStatsView(coordinator: coordinator)
+                }
+                .padding(.vertical, 8)
+            }
             
             // Issue evidence and field guidance
             if verdict != .success {
@@ -48,7 +81,12 @@ struct CompletionStatusHeaderView: View {
     let verdict: CompletionVerdict
 
     private var presentation: CompletionVerdictPresentation {
-        CompletionVerdictPresentation.make(verdict)
+        CompletionVerdictPresentation.make(
+            state: coordinator.operationState,
+            rows: coordinator.results,
+            hasErrors: coordinator.hasErrors,
+            hasCriticalErrors: coordinator.hasCriticalErrors
+        )
     }
 
     private var statusColor: Color {
@@ -60,29 +98,20 @@ struct CompletionStatusHeaderView: View {
     }
     
     var body: some View {
-        VStack(spacing: 12) {
-            // Status icon
+        HStack(alignment: .top, spacing: 12) {
             Image(systemName: presentation.symbol)
-                .font(.system(size: 48, weight: .light))
+                .font(.system(size: 24, weight: .semibold))
                 .foregroundColor(statusColor)
-            
-            // Status title
-            Text(presentation.title)
-                .font(.system(size: 22, weight: .semibold))
-                .foregroundColor(.white)
-                .multilineTextAlignment(.center)
-            
-            // Completion time
-            if let duration = coordinator.operationDuration {
-                Text("Completed in \(duration)")
-                    .font(.system(size: 14))
-                    .foregroundColor(.white.opacity(0.7))
+            VStack(alignment: .leading, spacing: 6) {
+                Text(presentation.title).font(.title2.weight(.semibold))
+                Text(presentation.detail).font(.subheadline).foregroundColor(.secondary)
+                if let duration = coordinator.operationDuration {
+                    Text("Completed in \(duration)").font(.footnote).foregroundColor(.secondary)
+                }
             }
-            Text(presentation.detail)
-                .font(.system(size: 13))
-                .foregroundColor(.white.opacity(0.68))
-                .multilineTextAlignment(.center)
+            Spacer(minLength: 0)
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }
 
@@ -270,100 +299,26 @@ struct ErrorDetailsView: View {
 
 struct CompletionActionButtonsView: View {
     @ObservedObject var coordinator: SharedAppCoordinator
-    
+
     var body: some View {
         VStack(spacing: 12) {
-            // Primary actions
-            HStack(spacing: 12) {
-                // Generate Report button
-                Button {
-                    Task {
-                        await coordinator.generateReport()
-                    }
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "doc.text.magnifyingglass")
-                            .font(.system(size: 14, weight: .semibold))
-                        Text("Generate Report")
-                            .font(.system(size: 14, weight: .semibold))
-                    }
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color.blue)
-                    )
-                }
-                .buttonStyle(.plain)
-                
-                // New Transfer button  
-                Button {
-                    // Reset for new transfer
-                    coordinator.sourceURL = nil
-                    coordinator.destinationURLs = []
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "plus.circle.fill")
-                            .font(.system(size: 14, weight: .semibold))
-                        Text("New Transfer")
-                            .font(.system(size: 14, weight: .semibold))
-                    }
-                    .foregroundColor(.white)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 14)
-                    .background(
-                        RoundedRectangle(cornerRadius: 10)
-                            .fill(Color.green)
-                    )
-                }
-                .buttonStyle(.plain)
+            Button {
+                Task { await coordinator.generateReport() }
+            } label: {
+                Label("Export report", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity, minHeight: 44)
             }
-            
-            // Secondary actions
-            HStack(spacing: 12) {
-                if coordinator.hasErrors {
-                    // View Error Details button
-                    Button {
-                        // Show error details sheet
-                    } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "list.bullet.rectangle")
-                                .font(.system(size: 12, weight: .medium))
-                            Text("View Error Details")
-                                .font(.system(size: 12, weight: .medium))
-                        }
-                        .foregroundColor(.white.opacity(0.8))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 10)
-                        .background(
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.white.opacity(0.1))
-                        )
-                    }
-                    .buttonStyle(.plain)
-                }
-                
-                // Share Results button
-                Button {
-                    // Share operation results
-                } label: {
-                    HStack(spacing: 8) {
-                        Image(systemName: "square.and.arrow.up")
-                            .font(.system(size: 12, weight: .medium))
-                        Text("Share Results")
-                            .font(.system(size: 12, weight: .medium))
-                    }
-                    .foregroundColor(.white.opacity(0.8))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.white.opacity(0.1))
-                    )
-                }
-                .buttonStyle(.plain)
+            .buttonStyle(.bordered)
+            Button {
+                coordinator.resetForNewOperation()
+                coordinator.sourceURL = nil
+                coordinator.destinationURLs = []
+            } label: {
+                Label("New transfer", systemImage: "plus")
+                    .frame(maxWidth: .infinity, minHeight: 44)
             }
+            .buttonStyle(.borderedProminent)
+            .tint(.green)
         }
     }
 }

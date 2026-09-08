@@ -6,6 +6,7 @@ struct ModularContentView: View {
     @ObservedObject var coordinator: SharedAppCoordinator
     let navigationPresentation: AdaptiveNavigationPresentation
     @State private var showingSettings = false
+    @State private var showingTransfers = false
     @State private var showingVolumeSelector = false
     @State private var showCancelToast = false
     
@@ -48,6 +49,9 @@ struct ModularContentView: View {
                 SharedLogger.info("Transfer completed, showing summary")
             }
         }
+        .sheet(isPresented: $showingTransfers) {
+            TransferLibraryView(coordinator: coordinator, journal: coordinator.transferJournal)
+        }
         .sheet(isPresented: $showingSettings) {
             SettingsSheetView(coordinator: coordinator)
         }
@@ -74,7 +78,11 @@ extension ModularContentView {
     private var mainContentArea: some View {
         VStack(spacing: 0) {
             // Header with gear icon (always visible)  
-            HeaderSectionView(showingSettings: $showingSettings)
+            HeaderSectionView(showingSettings: $showingSettings, showingTransfers: $showingTransfers)
+            if coordinator.transferJournal.records.contains(where: { $0.state == .interrupted }) {
+                Button("Interrupted transfer — review in Transfers") { showingTransfers = true }
+                    .font(.callout).foregroundStyle(.orange).padding(.horizontal)
+            }
             
             // Three-state architecture using components
             if coordinator.isOperationInProgress {
@@ -83,9 +91,9 @@ extension ModularContentView {
                     .onAppear {
                         SharedLogger.debug("UI switched to OPERATION view")
                     }
-            } else if showCompletionSummary {
+            } else if showCompletionSummary || coordinator.operationState == .failed {
                 // COMPLETION STATE: Show transfer summary
-                CompletionSummaryView(coordinator: coordinator)
+                ScrollView { CompletionSummaryView(coordinator: coordinator) }
                     .onAppear {
                         SharedLogger.debug("UI switched to COMPLETION view")
                     }
@@ -105,9 +113,12 @@ extension ModularContentView {
 
 struct HeaderSectionView: View {
     @Binding var showingSettings: Bool
+    @Binding var showingTransfers: Bool
     
     var body: some View {
         HStack {
+            Button("Transfers", systemImage: "clock.arrow.circlepath") { showingTransfers = true }
+                .frame(minHeight: 44)
             Spacer()
             
             Button {
@@ -1092,10 +1103,18 @@ struct SettingsSheetView: View {
         NavigationView {
             Form {
                 Section("Verification") {
-                    Picker("Mode", selection: $coordinator.verificationMode) {
-                        ForEach(VerificationMode.allCases, id: \.self) { mode in
-                            Text(mode.rawValue)
+                    Text(coordinator.verificationMode == .standard ? "Verified copy · SHA-256" : coordinator.verificationMode.rawValue)
+                    DisclosureGroup("Advanced verification") {
+                        Picker("Verification", selection: $coordinator.verificationMode) {
+                            ForEach(VerificationMode.allCases) { mode in
+                                Text(mode.rawValue).tag(mode)
+                            }
                         }
+                        .onChange(of: coordinator.verificationMode) { _, _ in coordinator.saveVerificationMode() }
+                        Text(coordinator.verificationMode.description).font(.footnote)
+                        Toggle("ASC MHL handoff record", isOn: $coordinator.generateASCMHL)
+                            .disabled(coordinator.verificationMode == .quick)
+                        Text("Creates an interoperable checksum record for verified copies.").font(.footnote)
                     }
                 }
 

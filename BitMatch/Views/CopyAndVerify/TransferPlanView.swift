@@ -22,7 +22,9 @@ struct TransferPlanView: View {
             if usesProjectWorkflow || hasPreparedProjectTransfer {
                 PhotographerJobSetupView(coordinator: coordinator)
             }
-            TransferPlanPreflightCard(plan: plan)
+            if plan.status != .ready {
+                TransferPlanPreflightCard(plan: plan)
+            }
             optionSummary
             TransferOptionsView(coordinator: coordinator, isExpanded: $optionsExpanded)
             actionArea
@@ -57,18 +59,15 @@ struct TransferPlanView: View {
         VStack(alignment: .leading, spacing: 9) {
             HStack(alignment: .firstTextBaseline) {
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("Transfer route")
+                    Text("Copy & verify")
                         .font(.system(size: 14, weight: .semibold))
                         .foregroundColor(.white)
-                    Text("Choose the card or folder to copy, then add a folder on each backup drive.")
-                        .font(.system(size: 10))
+                    Text("Choose a source and a folder on each backup drive.")
+                        .font(.system(size: 12))
                         .foregroundColor(.white.opacity(0.58))
                 }
                 Spacer(minLength: 12)
-                Text("TRANSFER SETUP")
-                    .font(.system(size: 9, weight: .bold))
-                    .tracking(0.9)
-                    .foregroundColor(.white.opacity(0.38))
+
             }
             // This remains the single owner of folder panels and drop validation.
             selectionView(presentation)
@@ -83,26 +82,11 @@ struct TransferPlanView: View {
     }
 
     private var optionSummary: some View {
-        VStack(alignment: .leading, spacing: 7) {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 6) {
-                    ForEach(plan.optionSummary, id: \.self) { summary in
-                        Text(summary).font(.system(size: 10, weight: .medium))
-                            .foregroundColor(.white.opacity(0.7)).padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Capsule().fill(Color.white.opacity(0.07)))
-                    }
-                }
-            }
-            Text(coordinator.verificationMode.description)
-                .font(.system(size: 11))
-                .foregroundColor(.white.opacity(0.62))
-                .fixedSize(horizontal: false, vertical: true)
-            if coordinator.verificationMode == .quick {
-                Label("Quick mode does not use checksum verification.", systemImage: "exclamationmark.triangle.fill")
-                    .font(.system(size: 10)).foregroundColor(.orange)
-                    .accessibilityLabel("Warning: Quick mode does not use checksum verification")
-            }
-        }
+        Label(coordinator.verificationMode == .standard ? "Verified copy · SHA-256" : coordinator.verificationMode.description,
+              systemImage: coordinator.verificationMode == .quick ? "exclamationmark.triangle" : "checkmark.shield")
+            .font(.system(size: 13, weight: .medium))
+            .foregroundColor(coordinator.verificationMode == .quick ? .orange : .white.opacity(0.75))
+            .frame(maxWidth: .infinity, alignment: .leading)
     }
 
     private var transferKindControl: some View {
@@ -157,7 +141,7 @@ struct TransferPlanView: View {
                 .foregroundColor(selected ? .green : .white.opacity(0.55))
             VStack(alignment: .leading, spacing: 2) {
                 Text(title).font(.system(size: 12, weight: .semibold))
-                Text(detail).font(.system(size: 10)).foregroundColor(.white.opacity(0.58))
+                Text(detail).font(.system(size: 12)).foregroundColor(.white.opacity(0.58))
             }
             Spacer(minLength: 0)
             if selected { Image(systemName: "checkmark.circle.fill").foregroundColor(.green) }
@@ -184,10 +168,10 @@ struct TransferPlanView: View {
         return VStack(alignment: .leading, spacing: 8) {
             if let estimate = coordinator.timeEstimate {
                 Text("Estimated time: \(estimate.formatted) · \(estimate.speedSummary)")
-                    .font(.system(size: 11)).foregroundColor(.white.opacity(0.6))
+                    .font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
             } else if coordinator.isCalculatingEstimate {
                 Label("Calculating transfer estimate…", systemImage: "clock")
-                    .font(.system(size: 11)).foregroundColor(.blue)
+                    .font(.system(size: 12)).foregroundColor(.blue)
             }
             Button(action: onStart) {
                 Label(plan.actionTitle, systemImage: "arrow.right.doc.on.clipboard")
@@ -201,12 +185,12 @@ struct TransferPlanView: View {
                 : TransferPlanStatusDisplay.make(plan.status).detail))
             if !canStart {
                 Text(photographerStart?.blocker ?? TransferPlanStatusDisplay.make(plan.status).detail)
-                    .font(.system(size: 11))
+                    .font(.system(size: 12))
                     .foregroundColor(.white.opacity(0.58))
                     .fixedSize(horizontal: false, vertical: true)
             } else {
-                Text("Your source files stay in place. When the transfer finishes, review the results for every destination.")
-                    .font(.system(size: 11))
+                Text("Source files stay in place.")
+                    .font(.system(size: 12))
                     .foregroundColor(.white.opacity(0.58))
                     .fixedSize(horizontal: false, vertical: true)
             }
@@ -243,7 +227,7 @@ private func planCard(title: String, icon: String, tint: Color, primary: String,
     VStack(alignment: .leading, spacing: 5) {
         Label(title, systemImage: icon).font(.system(size: 9, weight: .bold)).tracking(1).foregroundColor(tint)
         Text(primary).font(.system(size: 13, weight: .semibold)).lineLimit(1).foregroundColor(.white)
-        Text(detail).font(.system(size: 10)).foregroundColor(.white.opacity(0.58))
+        Text(detail).font(.system(size: 12)).foregroundColor(.white.opacity(0.58))
     }
     .frame(maxWidth: .infinity, alignment: .leading).padding(11)
     .background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.04)))
@@ -257,7 +241,7 @@ struct TransferPlanPreflightCard: View {
             Image(systemName: display.symbol).foregroundColor(tint(for: display.tone)).font(.system(size: 14, weight: .semibold))
             VStack(alignment: .leading, spacing: 3) {
                 Text(display.title).font(.system(size: 12, weight: .semibold)).foregroundColor(.white)
-                Text(display.detail).font(.system(size: 11)).foregroundColor(.white.opacity(0.62)).fixedSize(horizontal: false, vertical: true)
+                Text(display.detail).font(.system(size: 12)).foregroundColor(.white.opacity(0.62)).fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
         }
@@ -290,17 +274,24 @@ struct TransferOptionsView: View {
                     ForEach(VerificationMode.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .onChange(of: coordinator.verificationMode) { _, _ in coordinator.saveVerificationMode() }
+                Toggle("ASC MHL handoff record", isOn: Binding(
+                    get: { coordinator.sharedCoordinator.generateASCMHL },
+                    set: { coordinator.sharedCoordinator.generateASCMHL = $0 }
+                ))
+                    .disabled(coordinator.verificationMode == .quick)
+                Text("Creates an interoperable checksum record for verified copies.")
+                    .font(.system(size: 12)).foregroundColor(.secondary)
                 Toggle("Create PDF & CSV Report", isOn: $coordinator.settingsViewModel.prefs.makeReport).tint(.green)
             }.padding(.top, 10)
         } label: {
             HStack {
-                Label("Options", systemImage: "slider.horizontal.3")
+                Label("Advanced", systemImage: "slider.horizontal.3")
                 Spacer()
                 Text("\(coordinator.verificationMode.rawValue) · \(coordinator.settingsViewModel.prefs.makeReport ? "Reports on" : "Reports off")")
-                    .font(.system(size: 10)).foregroundColor(.white.opacity(0.55))
+                    .font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
             }.font(.system(size: 12, weight: .medium)).foregroundColor(.white.opacity(0.9))
         }
         .padding(12).background(RoundedRectangle(cornerRadius: 10).fill(Color.white.opacity(0.035)))
-        .accessibilityLabel("Options").accessibilityHint("Shows camera labels, verification, and report settings")
+        .accessibilityHint("Shows camera labels, verification, and report settings")
     }
 }

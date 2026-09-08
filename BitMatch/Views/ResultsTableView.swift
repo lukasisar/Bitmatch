@@ -4,6 +4,7 @@ struct ResultsTableView: View {
     @ObservedObject var coordinator: AppCoordinator
     @Binding var showOnlyIssues: Bool
     @State private var scrollToBottom = false
+    @State private var showsFileDetails = false
     @State private var availableWidth: CGFloat = ResultTableLayoutPolicy.detailedThreshold
     // Removed caching @State to avoid mutating state during view updates
     
@@ -46,14 +47,19 @@ struct ResultsTableView: View {
                     .overlay(Color.white.opacity(0.1))
             }
 
-            // Filter and stats header with cancel button
-            statsHeader
-            
-            Divider()
-                .overlay(Color.white.opacity(0.1))
-            
-            // Results list with proper scrolling
-            resultsList
+            if completionPresentation != nil {
+                destinationSummaries
+                DisclosureGroup("File details", isExpanded: $showsFileDetails) {
+                    statsHeader
+                    resultsList
+                }
+                .padding(12)
+            } else {
+                statsHeader
+                Divider().overlay(Color.white.opacity(0.1))
+                resultsList
+            }
+
         }
         .background(
             RoundedRectangle(cornerRadius: 12)
@@ -63,8 +69,25 @@ struct ResultsTableView: View {
                         .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
                 )
         )
-        .frame(maxHeight: 600)  // FIX: Increased from 400 to 600
+        .frame(maxHeight: completionPresentation == nil ? 600 : nil)
         .background(widthReader)
+    }
+
+    private var destinationSummaries: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            ForEach(DestinationResultSummary.make(rows: results, destinations: coordinator.fileSelectionViewModel.destinationURLs)) { summary in
+                HStack(alignment: .top, spacing: 10) {
+                    Image(systemName: summary.needsAttention ? "exclamationmark.triangle" : "checkmark.circle")
+                        .foregroundColor(summary.needsAttention ? .orange : .green)
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(summary.title).font(.system(size: 14, weight: .semibold))
+                        Text(summary.detail).font(.system(size: 12)).foregroundColor(.secondary)
+                    }
+                    Spacer()
+                }
+            }
+        }
+        .padding(14)
     }
 
     private func completionVerdict(_ presentation: CompletionVerdictPresentation) -> some View {
@@ -78,7 +101,7 @@ struct ResultsTableView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 Text(presentation.title)
-                    .font(.system(size: 12, weight: .semibold))
+                    .font(.system(size: 14, weight: .semibold))
                     .foregroundColor(.white.opacity(0.9))
                 Text(presentation.detail)
                     .font(.system(size: 11))

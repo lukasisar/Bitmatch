@@ -1,0 +1,15 @@
+{
+  "result": "Passed",
+  "totalTestCount": 485,
+  "passedTests": 484,
+  "failedTests": 0,
+  "skippedTests": 1,
+  "statistics": [
+    {
+      "subtitle": "25 test runs",
+      "title": "6 tests ran with dynamic parameters"
+    }
+  ],
+  "environmentDescription": "BitMatch \u00b7 Built with macOS 26.6",
+  "parameterizedPassedRuns": 503
+}

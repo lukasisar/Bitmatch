@@ -7,6 +7,52 @@ struct PhotographerReportTests {
     private let eventDate = Date(timeIntervalSince1970: 1_752_499_800)
     private let locallySafeAt = Date(timeIntervalSince1970: 1_752_503_400)
 
+    @Test func automaticReportsRetainHandoffIssuesAndActualQuickMethod() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("report-handoff-\(UUID())")
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var prefs = ReportPrefs()
+        prefs.makeReport = false
+        prefs.verificationMode = .quick
+        prefs.notes = "ASC MHL: Backup A, \"existing history\" preserved.\nReview before handoff."
+        await ReportExporter.export(mode: .copyAndVerify, jobID: UUID(), started: eventDate,
+            finished: locallySafeAt, sourceURL: nil, destinationURLs: [root], results: results(),
+            fileCount: 2, matchCount: 1, prefs: prefs, workers: 1, totalBytesProcessed: 101,
+            generateFullReport: false)
+        let files = try FileManager.default.contentsOfDirectory(at: root.appendingPathComponent("Reports"), includingPropertiesForKeys: nil)
+        let jsonURL = try #require(files.first { $0.pathExtension == "json" })
+        let csvURL = try #require(files.first { $0.pathExtension == "csv" })
+        let object = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: jsonURL)) as? [String: Any])
+        let verification = try #require(object["verification"] as? [String: Any])
+        #expect(object["notes"] as? String == prefs.notes)
+        #expect(verification["method"] as? String == "size-only")
+        #expect(verification["algorithm"] == nil)
+        let csv = try String(contentsOf: csvURL, encoding: .utf8)
+        #expect(csv.contains("Notes,"))
+        #expect(csv.contains("\"\"existing history\"\""))
+        #expect(csv.contains("Review before handoff."))
+        #expect(csv.contains("contents not checksum verified"))
+    }
+
+    @Test func actualVerificationModesOverrideLegacyReportCheckbox() {
+        var prefs = ReportPrefs()
+        prefs.verifyWithChecksum = false
+        prefs.verificationMode = .paranoid
+        #expect(ReportExporter.verificationDescription(for: prefs).method == "checksum-and-byte-compare")
+        #expect(ReportExporter.verificationDescription(for: prefs).algorithm == "SHA-256")
+        prefs.verificationMode = .thorough
+        #expect(ReportExporter.verificationDescription(for: prefs).algorithm == "SHA-256, MD5")
+        prefs.verificationMode = nil
+        #expect(ReportExporter.verificationDescription(for: prefs).method == "byte-compare")
+    }
+
+    @Test func oldReportPreferencesDecodeWithoutActualVerificationMode() throws {
+        var object = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(ReportPrefs())) as? [String: Any])
+        object.removeValue(forKey: "verificationMode")
+        let decoded = try JSONDecoder().decode(ReportPrefs.self, from: JSONSerialization.data(withJSONObject: object))
+        #expect(decoded.verificationMode == nil)
+    }
+
     @Test func payloadEncodesCompletePhotographyProvenanceAndEveryAuthoritativeRow() throws {
         let payload = try PhotographerReportPayload.make(context: context(), results: results())
         let encoder = JSONEncoder()
@@ -79,6 +125,10 @@ struct PhotographerReportTests {
 
         #expect(report.reportVersion == "3.0")
         #expect(report.photographyJob == nil)
+        var legacyObject = try #require(JSONSerialization.jsonObject(with: JSONEncoder().encode(report)) as? [String: Any])
+        legacyObject.removeValue(forKey: "notes")
+        let decodedLegacyReport = try JSONDecoder().decode(EnhancedJSONReport.self, from: JSONSerialization.data(withJSONObject: legacyObject))
+        #expect(decodedLegacyReport.notes == nil)
         #expect(report.source.path == "/CARD")
         #expect(report.statistics.totalFiles == 2)
         #expect(report.statistics.matches == 1)

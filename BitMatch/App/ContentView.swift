@@ -8,8 +8,7 @@ struct ContentView: View {
 #if DEBUG
     @ObservedObject private var devModeManager = DevModeManager.shared
 #endif
-    @State private var showResumeDialog = false
-    @State private var resumableOperation: OperationStateManager.PersistedOperation?
+    @State private var showingTransfers = false
     
     // Keep an active transfer visually stable while its queue grows.
     @State private var contentHeight: CGFloat = 900
@@ -81,10 +80,14 @@ struct ContentView: View {
     @ViewBuilder
     private var configuredMainContentView: some View {
         keyboardShortcutsView
+            .sheet(isPresented: $showingTransfers) {
+                TransferLibraryView(coordinator: coordinator.sharedCoordinator, journal: coordinator.sharedCoordinator.transferJournal)
+                    .onAppear { coordinator.sharedCoordinator.reportSettings = coordinator.settingsViewModel.prefs }
+            }
             .onAppear {
                 restoreWindowFrame()
                 updateWindowSize(width: compactWindowWidth, height: idealWindowHeight)
-                checkForResumableOperations()
+
             }
             .alert("Error", isPresented: $errorHandler.showErrorAlert) {
                 if errorHandler.currentError?.canRetry == true {
@@ -147,6 +150,10 @@ struct ContentView: View {
     private var mainContentArea: some View {
         VStack(spacing: 0) {
             headerView
+            if coordinator.sharedCoordinator.transferJournal.records.contains(where: { $0.state == .interrupted }) {
+                Button("Interrupted transfer — review in Transfers") { showingTransfers = true }
+                    .font(.callout).foregroundStyle(.orange).padding(.bottom, 8)
+            }
             mainScrollView
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -157,7 +164,6 @@ struct ContentView: View {
     private var mainScrollView: some View {
         ScrollView {
             VStack(spacing: 16) {
-                resumeBannerArea
                 mainContentSwitch
                 resultsArea
             }
@@ -165,17 +171,6 @@ struct ContentView: View {
             .padding(.bottom, 20)
         }
         .frame(maxHeight: lockHeight ? contentHeight : 900)
-    }
-    
-    @ViewBuilder
-    private var resumeBannerArea: some View {
-        if showResumeDialog, let operation = resumableOperation {
-            resumeBanner(for: operation)
-                .transition(.asymmetric(
-                    insertion: .move(edge: .top).combined(with: .opacity),
-                    removal: .move(edge: .top).combined(with: .opacity)
-                ))
-        }
     }
     
     @ViewBuilder
@@ -187,7 +182,6 @@ struct ContentView: View {
             modeSpecificView
         default:
             completionView
-                .frame(height: lockHeight ? contentHeight : nil)
         }
     }
     
@@ -195,7 +189,7 @@ struct ContentView: View {
     private var resultsArea: some View {
         if coordinator.currentMode != .masterReport &&
            (coordinator.isOperationInProgress ||
-            (!coordinator.results.isEmpty && coordinator.completionState != .idle)) {
+            (coordinator.completionState != .idle && (coordinator.currentMode == .copyAndVerify || !coordinator.results.isEmpty))) {
             ResultsTableView(
                 coordinator: coordinator,
                 showOnlyIssues: Binding(
@@ -226,6 +220,12 @@ struct ContentView: View {
                     }
                 }
                 Spacer(minLength: 8)
+                Button { showingTransfers = true } label: {
+                    Image(systemName: "clock.arrow.circlepath").frame(width: 36, height: 36)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Transfers and history")
+                .help("Transfers and history")
                 Button {
                     openPreferences()
                 } label: {
@@ -283,17 +283,12 @@ struct ContentView: View {
     @ViewBuilder
     private var completionView: some View {
         VStack(spacing: 14) {
-            CompletionView(
-                message: completionMessage,
-                iconName: completionIcon,
-                iconColor: completionColor,
-                onNewTask: {
-                    coordinator.resetForNewOperation()
-                    // FIX: Also reset height lock when starting new task
-                    lockHeight = false
-                    isOperationActive = false
-                }
-            )
+            Button("New transfer", systemImage: "plus") {
+                coordinator.resetForNewOperation()
+                lockHeight = false
+                isOperationActive = false
+            }
+            .buttonStyle(.bordered)
             if let job = coordinator.photographerJobViewModel.dashboardJob,
                CompletionEvidencePresentation.shouldShowProjectMedia(
                 hasDashboardJob: true,
@@ -310,78 +305,6 @@ struct ContentView: View {
             insertion: .scale(scale: 0.95).combined(with: .opacity),
             removal: .scale(scale: 1.05).combined(with: .opacity)
         ))
-    }
-    
-    @ViewBuilder
-    private func resumeBanner(for operation: OperationStateManager.PersistedOperation) -> some View {
-        HStack(spacing: 16) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .font(.system(size: 24))
-                .foregroundColor(.yellow)
-            
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Resume Previous Operation?")
-                    .font(.system(size: 14, weight: .semibold))
-                    .foregroundColor(.white)
-                
-                Text("\(operation.processedCount) of \(operation.totalCount) files completed")
-                    .font(.system(size: 12))
-                    .foregroundColor(.white.opacity(0.7))
-                
-                // Show time since interruption
-                if let lastCheckpoint = operation.checkpoints.last {
-                    let timeSince = Date().timeIntervalSince(lastCheckpoint.timestamp)
-                    Text("Last active \(formatTimeInterval(timeSince)) ago")
-                        .font(.system(size: 11))
-                        .foregroundColor(.white.opacity(0.5))
-                }
-            }
-            
-            Spacer()
-            
-            HStack(spacing: 12) {
-                Button("Start Fresh") {
-                    withAnimation {
-                        showResumeDialog = false
-                        OperationStateManager.clearState(for: operation.id)
-                    }
-                }
-                .buttonStyle(CustomButtonStyle(isDestructive: true))
-                
-                Button {
-                    withAnimation {
-                        showResumeDialog = false
-                        // Phase 3: resume via SharedAppCoordinator
-                        Task { await coordinator.sharedCoordinator.resumeOperation() }
-                    }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: "arrow.clockwise")
-                        Text("Resume Now")
-                    }
-                    .font(.system(size: 12, weight: .semibold))
-                    .foregroundColor(.black)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 8)
-                    .background(
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.yellow)
-                    )
-                }
-                .buttonStyle(.plain)
-            }
-        }
-        .padding(20)
-        .background(
-            RoundedRectangle(cornerRadius: 12)
-                .fill(Color.yellow.opacity(0.15))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(Color.yellow.opacity(0.3), lineWidth: 1)
-                )
-        )
-        .padding(.horizontal, 20)
-        .padding(.top, 8)
     }
     
     private var darkBackground: some View {
@@ -425,29 +348,6 @@ struct ContentView: View {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
                 lockHeight = false
                 isOperationActive = false
-            }
-        }
-    }
-    
-    private func formatTimeInterval(_ interval: TimeInterval) -> String {
-        if interval < 60 {
-            return "moments"
-        } else if interval < 3600 {
-            return "\(Int(interval / 60)) minutes"
-        } else if interval < 86400 {
-            return "\(Int(interval / 3600)) hours"
-        } else {
-            return "\(Int(interval / 86400)) days"
-        }
-    }
-    
-    private func checkForResumableOperations() {
-        if let resumeInfo = OperationStateManager.getResumeInfo() {
-            if resumeInfo.shouldResume {
-                resumableOperation = resumeInfo.operation
-                withAnimation(.spring(response: 0.4)) {
-                    showResumeDialog = true
-                }
             }
         }
     }

@@ -15,6 +15,8 @@ These rows describe available tests, not claims that they passed. A published au
 
 [2026-09-06 development validation](validation/2026-09-06/README.md): the Mac suite passed on rerun, the iPad simulator build passed, and the seeded soak verified 450 destination outputs. The report retains the initial pause-reset timeout. APFS image creation was blocked by the host's “Resource busy” error before tests began. The real app demo independently verified 24 local copies. None of these results establishes physical-device compatibility.
 
+[2026-09-08 development validation](validation/2026-09-08/README.md) covers the shared queue, recovery, ASC MHL reference checks, and Mac/iPhone/iPad interface checks. These are source and simulator results; v0.1.4 remains the downloadable release.
+
 ## Physical results
 
 | Report | Date | App revision / OS | Source and destinations / filesystems | Connection | Scenario | Outcome |

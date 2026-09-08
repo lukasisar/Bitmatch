@@ -54,8 +54,13 @@ struct CopyAndVerifyView: View {
                     MobileProjectSetupCard(coordinator: coordinator)
                 }
 
-                IpadTransferPlanPreflightCard(plan: plan)
-                IpadTransferPlanOptionSummary(plan: plan, isQuickMode: coordinator.verificationMode == .quick)
+                if plan.status != .ready {
+                    IpadTransferPlanPreflightCard(plan: plan)
+                }
+                Label(coordinator.verificationMode == .standard ? "Verified copy · SHA-256" : coordinator.verificationMode.description, systemImage: coordinator.verificationMode == .quick ? "exclamationmark.triangle" : "checkmark.shield")
+                    .font(.subheadline)
+                    .foregroundColor(coordinator.verificationMode == .quick ? .orange : .white.opacity(0.75))
+                    .frame(maxWidth: .infinity, alignment: .leading)
 
                 DisclosureGroup(isExpanded: $optionsExpanded) {
                     VStack(spacing: 14) {
@@ -67,12 +72,16 @@ struct CopyAndVerifyView: View {
                             coordinator: coordinator,
                             isExpanded: $verificationModeExpanded
                         )
+                        Toggle("ASC MHL handoff record", isOn: $coordinator.generateASCMHL)
+                            .disabled(coordinator.verificationMode == .quick)
+                        Text("Creates an interoperable checksum record for verified copies.")
+                            .font(.footnote).foregroundColor(.secondary)
                         ReportToggleCard(coordinator: coordinator)
                     }
                     .padding(.top, 12)
                 } label: {
                     HStack {
-                        Label("Options", systemImage: "slider.horizontal.3")
+                        Label("Advanced", systemImage: "slider.horizontal.3")
                         Spacer()
                         Text("\(coordinator.verificationMode.rawValue) · \(coordinator.reportSettings.makeReport ? "Reports on" : "Reports off")")
                             .font(.system(size: 12))
@@ -88,7 +97,6 @@ struct CopyAndVerifyView: View {
                     RoundedRectangle(cornerRadius: 12)
                         .fill(Color.white.opacity(0.035))
                 )
-                .accessibilityLabel("Options")
                 .accessibilityHint("Shows camera labels, verification, and report settings")
 
                 StartTransferButtonView(
@@ -549,8 +557,8 @@ struct EnhancedSourceDestinationView: View {
                 stackedCards
             }
         }
-        .padding(.horizontal, 20)
-        .padding(.vertical, 16)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 12)
         .background(
             RoundedRectangle(cornerRadius: 12)
                 .fill(Color.white.opacity(0.02))
@@ -578,7 +586,7 @@ struct ProfessionalSourceCard: View {
         VStack(alignment: .leading, spacing: 12) {
             // Header
             HStack {
-                Text("SOURCE FOLDER")
+                Text("Source")
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundColor(.white.opacity(0.6))
                     .tracking(1.0)
@@ -705,7 +713,7 @@ struct DestinationsFlowView: View {
         VStack(alignment: .leading, spacing: 12) {
             // Header
             VStack(alignment: .leading, spacing: 4) {
-                Text("DESTINATIONS")
+                Text("Backups")
                     .font(.system(size: 9, weight: .semibold))
                     .foregroundColor(.white.opacity(0.5))
                     .tracking(1.2)
@@ -753,8 +761,7 @@ struct DestinationsFlowView: View {
                 )
             } else {
                 // Vertical list of destination cards (for side-by-side layout)
-                ScrollView {
-                    LazyVStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
                         ForEach(coordinator.destinationURLs, id: \.self) { url in
                             CompactDestinationCard(url: url, coordinator: coordinator)
                         }
@@ -785,9 +792,7 @@ struct DestinationsFlowView: View {
                             }
                             .buttonStyle(.plain)
                         }
-                    }
                 }
-                .frame(maxHeight: 200)
             }
         }
     }
@@ -868,13 +873,15 @@ struct CompactDestinationCard: View {
             
             VStack(alignment: .leading, spacing: 2) {
                 Text(url.lastPathComponent)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.headline)
                     .foregroundColor(.white)
-                    .lineLimit(1)
+                    .lineLimit(2)
                 
-                Text("External Drive")
-                    .font(.system(size: 9))
-                    .foregroundColor(.white.opacity(0.5))
+                Text(url.path)
+                    .font(.footnote)
+                    .foregroundColor(.white.opacity(0.65))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
             
             Spacer()
@@ -1136,7 +1143,7 @@ struct CollapsibleVerificationSection: View {
                         .font(.system(size: 16))
                         .foregroundColor(.green)
                     
-                    Text("VERIFICATION MODE")
+                    Text("Verification")
                         .font(.system(size: 13, weight: .semibold))
                         .foregroundColor(.white.opacity(0.9))
                         .tracking(0.5)
@@ -1209,7 +1216,10 @@ struct VerificationModeRow: View {
     
     var body: some View {
         let isSelected = coordinator.verificationMode == mode
-        return Button { coordinator.verificationMode = mode } label: {
+        return Button {
+            coordinator.verificationMode = mode
+            coordinator.saveVerificationMode()
+        } label: {
             HStack(spacing: 12) {
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .font(.system(size: 18))

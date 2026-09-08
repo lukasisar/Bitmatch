@@ -38,7 +38,7 @@ struct CompletionVerdictPresentation: Equatable, Sendable {
         hasErrors: Bool,
         hasCriticalErrors: Bool
     ) -> Self {
-        make(
+        let presentation = make(
             CompletionVerdict.resolve(
                 state: state,
                 rows: rows,
@@ -46,5 +46,10 @@ struct CompletionVerdictPresentation: Equatable, Sendable {
                 hasCriticalErrors: hasCriticalErrors
             )
         )
+        if case .completed(let info) = state, !info.success {
+            return Self(title: presentation.title, detail: info.message, symbol: presentation.symbol,
+                        sourceGuidance: "Review results and handoff records before clearing source media.")
+        }
+        return presentation
     }
 }

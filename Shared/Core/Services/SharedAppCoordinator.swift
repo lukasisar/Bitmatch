@@ -34,6 +34,15 @@ class SharedAppCoordinator: ObservableObject {
     @Published var verificationMode: VerificationMode = .standard
     @Published var cameraLabelSettings = CameraLabelSettings()
     @Published var reportSettings = ReportPrefs()
+    @Published var generateASCMHL: Bool = UserDefaults.standard.object(forKey: "BitMatchGenerateASCMHL") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(generateASCMHL, forKey: "BitMatchGenerateASCMHL") }
+    }
+    let transferJournal: LocalTransferJournal
+    @Published private(set) var queueIsRunning = false
+    @Published private(set) var queueMessage: String?
+    @Published private(set) var isReplayingQueuedTransfer = false
+    private var isProcessingQueue = false
+    private var activeJournalRecordID: UUID?
     @Published var photographerJobViewModel: PhotographerJobViewModel
     var photographerReportFinalizer: PhotographerReportFinalizer?
 
@@ -96,14 +105,21 @@ class SharedAppCoordinator: ObservableObject {
 
     // MARK: - Initialization
     
-    init(platformManager: PlatformManager) {
+    init(platformManager: PlatformManager, transferJournal: LocalTransferJournal? = nil) {
         self.platformManager = platformManager
+        let environment = ProcessInfo.processInfo.environment
+        let isTesting = environment["XCTestConfigurationFilePath"] != nil || environment["XCTestBundlePath"] != nil
+        let testJournalURL = isTesting ? FileManager.default.temporaryDirectory
+            .appendingPathComponent("BitMatchTestJournal-\(UUID().uuidString).json") : nil
+        self.transferJournal = transferJournal ?? LocalTransferJournal(fileURL: testJournalURL)
         let projectStore = UserDefaultsPhotographerJobStore()
         self.photographerJobViewModel = PhotographerJobViewModel(
             store: projectStore,
             remoteBackupCoordinator: UnavailableRemoteProjectCoordinator(store: projectStore)
         )
         setupBindings()
+        self.transferJournal.objectWillChange.sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         // Default first launch to checksum verification; honor last-picked thereafter.
         if let saved = UserDefaults.standard.string(forKey: "lastVerificationMode"),
            let mode = VerificationMode.allCases.first(where: { $0.rawValue == saved }) {
@@ -220,10 +236,85 @@ class SharedAppCoordinator: ObservableObject {
     
     // MARK: - Operation Control
 
-    func startOperation() async {
+    func startQueue() {
+        guard !(isOperationInProgress && currentMode == .compareFolders) else {
+            queueIsRunning = false
+            queueMessage = "Finish or cancel the folder comparison, then choose Run queue."
+            return
+        }
+        queueMessage = nil
+        queueIsRunning = true
+        Task { await processNextQueuedTransfer() }
+    }
+
+    func stopQueueAfterCurrentTransfer() { queueIsRunning = false }
+
+    func retryTransfer(_ id: UUID, generateASCMHL: Bool? = nil) {
+        do {
+            _ = try transferJournal.requeue(id: id, generateASCMHL: generateASCMHL)
+            startQueue()
+        } catch { queueMessage = error.localizedDescription }
+    }
+
+    private func processNextQueuedTransfer() async {
+        guard queueIsRunning, !isProcessingQueue, !isOperationInProgress, activeStartID == nil else { return }
+        #if os(iOS)
+        guard UIApplication.shared.applicationState == .active else {
+            queueIsRunning = false
+            queueMessage = "Queue paused. Open BitMatch and choose Run queue to continue."
+            return
+        }
+        #endif
+        guard let record = transferJournal.records.filter({ $0.state == .queued && $0.projectID == nil })
+            .min(by: { $0.createdAt < $1.createdAt }) else {
+            queueIsRunning = false
+            return
+        }
+        guard !photographerJobViewModel.hasPreparedIngestAwaitingStart else {
+            queueIsRunning = false
+            queueMessage = "Finish or clear the prepared project card before running the queue."
+            return
+        }
+        isProcessingQueue = true
+        defer {
+            isProcessingQueue = false
+            isReplayingQueuedTransfer = false
+            if queueIsRunning { Task { await self.processNextQueuedTransfer() } }
+        }
+        do {
+            let access = try transferJournal.prepareToRun(id: record.id)
+            defer { access.release() }
+            isReplayingQueuedTransfer = true
+            sourceURL = access.sourceURL
+            destinationURLs = access.destinationURLs
+            verificationMode = record.verificationMode
+            cameraLabelSettings = record.cameraSettings
+            reportSettings = record.reportSettings
+            generateASCMHL = record.generateASCMHL
+            currentMode = .copyAndVerify
+            photographerReportFinalizer = nil
+            activeProjectCardID = nil
+            NotificationCenter.default.post(name: .init("BitMatchQueuedTransferSelected"), object: self)
+            await executeOperation(journalRecordID: record.id)
+        } catch {
+            queueIsRunning = false
+            queueMessage = error.localizedDescription
+            do {
+                try transferJournal.markRunning(id: record.id)
+                try transferJournal.interrupt(id: record.id, summary: error.localizedDescription)
+            } catch {
+                queueMessage = "Queue stopped: \(error.localizedDescription)"
+            }
+        }
+    }
+
+    func startOperation() async { await executeOperation(journalRecordID: nil) }
+
+    private func executeOperation(journalRecordID: UUID?) async {
         guard activeStartID == nil, !isOperationInProgress else { return }
         guard let sourceURL = sourceURL, !destinationURLs.isEmpty else {
             operationState = .failed
+            updateProjectLifecycle(for: .failed)
             await platformManager.presentAlert(
                 title: "Invalid Selection",
                 message: "Please select a source folder and at least one destination folder."
@@ -240,6 +331,10 @@ class SharedAppCoordinator: ObservableObject {
                 activeStartID = nil
                 startCancellationRequested = false
                 isOperationInProgress = false
+                activeJournalRecordID = nil
+                if queueIsRunning && !isProcessingQueue {
+                    Task { await self.processNextQueuedTransfer() }
+                }
             }
         }
 
@@ -258,6 +353,27 @@ class SharedAppCoordinator: ObservableObject {
             }
         }
 
+        // Commit the immutable selection before copying. Failed persistence must
+        // never leave a transfer running without a recoverable record.
+        let recordID: UUID
+        do {
+            recordID = try journalRecordID ?? transferJournal.enqueue(
+                sourceURL: sourceURL, destinationURLs: destinationURLs,
+                verificationMode: verificationMode, cameraSettings: cameraLabelSettings,
+                reportSettings: reportSettings, generateASCMHL: generateASCMHL,
+                projectID: photographerReportFinalizer == nil ? nil : photographerJobViewModel.activeJob?.id
+            )
+            try transferJournal.markRunning(id: recordID)
+            activeJournalRecordID = recordID
+        } catch {
+            queueIsRunning = false
+            queueMessage = error.localizedDescription
+            operationState = .failed
+            updateProjectLifecycle(for: .failed)
+            await platformManager.presentError(error)
+            return
+        }
+
         // Validate resolved destination paths before starting. Source-tree and
         // capacity checks run in the file operation after its manifest is built.
         do {
@@ -267,7 +383,10 @@ class SharedAppCoordinator: ObservableObject {
                 settings: cameraLabelSettings
             )
         } catch {
+            try? transferJournal.interrupt(id: recordID, summary: error.localizedDescription)
+            queueIsRunning = false
             operationState = .failed
+            updateProjectLifecycle(for: .failed)
             await platformManager.presentError(error)
             return
         }
@@ -288,7 +407,8 @@ class SharedAppCoordinator: ObservableObject {
             estimatedFiles: sourceFolderInfo?.fileCount ?? 100,
             estimatedBytes: sourceFolderInfo?.totalSize ?? 1_000_000_000,
             currentMode: currentMode,
-            photographerReportFinalizer: photographerReportFinalizer
+            photographerReportFinalizer: photographerReportFinalizer,
+            generateASCMHL: generateASCMHL
         )
 
         let callbacks = CopyVerifyCallbacks(
@@ -330,8 +450,27 @@ class SharedAppCoordinator: ObservableObject {
 
         do {
             currentOperation = try await copyVerifyExecutor.execute(config: config, callbacks: callbacks)
+            if startCancellationRequested {
+                try transferJournal.cancel(id: recordID, results: results)
+            } else if case .completed(let info) = operationState {
+                try transferJournal.finish(id: recordID, results: results, summary: info.message, hadIssues: !info.success)
+                if transferJournal.records.first(where: { $0.id == recordID })?.state != .completed { queueIsRunning = false }
+            } else {
+                try transferJournal.interrupt(id: recordID, summary: "Transfer did not reach verified completion.", results: results)
+                queueIsRunning = false
+            }
         } catch {
-            // Error already handled by executor
+            queueIsRunning = false
+            do {
+                if startCancellationRequested || error is CancellationError {
+                    try transferJournal.cancel(id: recordID, results: results)
+                } else {
+                    try transferJournal.interrupt(id: recordID, summary: error.localizedDescription, results: results)
+                }
+            } catch {
+                queueMessage = "Could not save transfer results: \(error.localizedDescription)"
+                operationState = .failed
+            }
         }
     }
 
@@ -371,6 +510,7 @@ class SharedAppCoordinator: ObservableObject {
     }
 
     func cancelOperation() {
+        queueIsRunning = false
         if activeStartID != nil {
             startCancellationRequested = true
         }

@@ -406,6 +406,14 @@ final class AppCoordinator: ObservableObject {
 
     // MARK: - Shared Core Bindings
     private func setupSharedCoordinatorBindings() {
+        NotificationCenter.default.publisher(for: .init("BitMatchQueuedTransferSelected"))
+            .sink { [weak self] notification in
+                guard let self, (notification.object as? SharedAppCoordinator) === self.sharedCoordinator else { return }
+                self.currentMode = .copyAndVerify
+                self.fileSelectionViewModel.sourceURL = self.sharedCoordinator.sourceURL
+                self.fileSelectionViewModel.destinationURLs = self.sharedCoordinator.destinationURLs
+                self.cameraLabelViewModel.destinationLabelSettings = self.sharedCoordinator.cameraLabelSettings
+            }.store(in: &cancellables)
         // Map SharedAppCoordinator progress → ProgressViewModel
         sharedCoordinator.$progress.compactMap { $0 }
             .throttle(for: .milliseconds(120), scheduler: RunLoop.main, latest: true)
@@ -435,7 +443,7 @@ final class AppCoordinator: ObservableObject {
         // throttled subscription above exists only to pace presentation work.
         sharedCoordinator.$progress.compactMap { $0 }
             .sink { [weak self] progress in
-                guard let self, self.currentMode == .copyAndVerify else { return }
+                guard let self, self.currentMode == .copyAndVerify && !self.sharedCoordinator.isReplayingQueuedTransfer else { return }
                 self.photographerJobViewModel.updateProgressStage(progress.currentStage)
             }
             .store(in: &cancellables)
@@ -449,7 +457,7 @@ final class AppCoordinator: ObservableObject {
                 if self.progressViewModel.progressMessage == "Ready" {
                     self.progressViewModel.setProgressMessage("Preparing transfer…")
                 }
-                if self.currentMode == .copyAndVerify {
+                if self.currentMode == .copyAndVerify && !self.sharedCoordinator.isReplayingQueuedTransfer {
                     switch state {
                     case .inProgress, .copying:
                         self.photographerJobViewModel.beginIngest(
@@ -466,13 +474,13 @@ final class AppCoordinator: ObservableObject {
             case .completed(let info):
                 self.progressViewModel.stopProgressTracking()
                 self.lastSharedBytesProcessed = 0
-                if self.currentMode == .copyAndVerify, !info.success {
+                if self.currentMode == .copyAndVerify && !self.sharedCoordinator.isReplayingQueuedTransfer, !info.success {
                     self.photographerJobViewModel.operationFailed()
                 }
             case .failed, .cancelled:
                 self.progressViewModel.stopProgressTracking()
                 self.lastSharedBytesProcessed = 0
-                if self.currentMode == .copyAndVerify {
+                if self.currentMode == .copyAndVerify && !self.sharedCoordinator.isReplayingQueuedTransfer {
                     if state == .cancelled {
                         self.photographerJobViewModel.cancelIngest()
                     } else {

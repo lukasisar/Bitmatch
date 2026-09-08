@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Interface: Simplify transfer setup and completion, keep optional controls under Advanced, and show a result for each backup on Mac, iPad, and iPhone.
+- ASC MHL: Create initial ASC MHL 2.0 inventories after SHA-256 verification; validate generated manifests and chains with the official reference tooling. Existing histories are preserved and reported as unsupported, never overwritten or presented as extended.
+- Recovery: Add a persistent local transfer queue, interrupted-attempt recovery, searchable history, and JSON/CSV exports across all three platforms. Queue entries retain independent settings and original folder identities; issues stop the queue.
+- Completion: Keep unverified copies and failed handoff records out of the successful verdict. Preserve complete file results for review and export.
+
 - Usability: Clarify source and backup selection, explain verification modes, show all preflight issues, and add next-step guidance beside Start and after completion.
 - Usability: Rename the one-time workflow to avoid confusion with Quick verification; preserve distinguishing suffixes in long destination names.
 - Testing: Retain fault/soak evidence and support reusable build directories without modifying their generated test configurations.

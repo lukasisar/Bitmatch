@@ -4,7 +4,7 @@
 
 Now with photographer jobs, reusable folder recipes, and optional SFTP backups on Mac. Because apparently “I'll just add one more feature” wasn't a joke.
 
-[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20iPadOS-blue)](https://github.com/mikecerisano/Bitmatch)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20iPadOS%20%7C%20iOS-blue)](https://github.com/mikecerisano/Bitmatch)
 [![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 [![Release](https://img.shields.io/github/v/release/mikecerisano/Bitmatch?include_prereleases)](https://github.com/mikecerisano/Bitmatch/releases)
 
@@ -18,7 +18,7 @@ Now with photographer jobs, reusable folder recipes, and optional SFTP backups o
 
 Signed and notarized macOS build on the [Releases page](https://github.com/mikecerisano/Bitmatch/releases). Supports Apple Silicon and Intel Macs.
 
-Requires **macOS 15.5 or newer**. For iPad, build from source for now; the target requires **iPadOS 18.5 or newer**.
+Requires **macOS 15.5 or newer**. For iPad and iPhone, build from source for now; they require **iPadOS/iOS 18.5 or newer**.
 
 ## How It Works
 
@@ -45,8 +45,10 @@ One card to dump? Use **One-time transfer**. A whole shoot with several cards an
 - **RAW/JPEG and sidecar reporting.** The little files count too. So do failures.
 - **Camera detection** for Sony, Canon, ARRI, RED, Blackmagic, Panasonic, Fujifilm, GoPro, DJI, Insta360, and generic DCIM.
 - **Folder compare** for stuff you already copied.
-- **PDF, CSV, and JSON reports** for producers who want documentation, or you when you want to check what happened. MHL generation is available in Thorough and Paranoid modes.
-- **Transfer preflight on Mac and iPad** shows the source, backups, options, and anything that needs fixing before Start.
+- **PDF, CSV, and JSON reports** for producers who want documentation, or you when you want to check what happened.
+- **Transfer preflight on Mac, iPad, and iPhone** shows the source, backups, options, and anything that needs fixing before Start.
+- **ASC MHL handoff records** after verified copies, with the details tucked under Advanced. This first version creates new inventories; it preserves existing histories and flags them for review. [Scope and validation](docs/validation/ascmhl/README.md).
+- **Transfer queue and history** on Mac, iPad, and iPhone. Queue cards with their own settings, review interrupted attempts, retry, and export the results.
 - **Optional SFTP backup on Mac** if you want an off-site copy after the local one is verified.
 
 ## Verification Modes
@@ -59,6 +61,16 @@ One card to dump? Use **One-time transfer**. A whole shoot with several cards an
 | Paranoid | Byte-by-byte comparison plus SHA-256 verification |
 
 Quick means copy only. It does **not** prove the contents match. A finished copy, a verified local backup, and a verified off-site backup are different things, and the app keeps them separate.
+
+## Queue, Recovery, and Handoff
+
+Open **Transfers** to queue another card or check what happened earlier. Each queued transfer keeps its own source, backups, and settings. The queue stops when something needs attention. A retry keeps the old attempt in history and checks the original folders before starting again; verified existing files can be reused after checking them.
+
+On iPhone and iPad, keep BitMatch open while it works. iOS can interrupt a transfer; the saved attempt will be marked interrupted when you reopen the app. Project cards stay with their project and need review there before another ingest.
+
+ASC MHL is on by default for verified copies. It adds another full read of each backup to create a compatible inventory. Existing ASC histories are left alone, with an issue shown instead of pretending they were extended. You can turn it off under **Advanced** when you don't need the handoff record. If a retry encounters an existing history, **Transfers → Details → Retry without ASC MHL** rechecks the copies without replacing that history.
+
+These features are in the development source. The current download is still v0.1.4.
 
 ## Photographer Jobs
 
@@ -114,8 +126,8 @@ Not for big budget shows or union shoots with a full DIT cart. Use the enterpris
 Xcode 16 or newer, with SDKs for the targets above. CI uses Xcode 16.4.
 
 1. Clone this repository and open `BitMatch.xcodeproj`.
-2. Pick `BitMatch` for Mac or `BitMatch-iPad` for iPad.
-3. For an iPad device build, set your development team in Signing & Capabilities.
+2. Pick `BitMatch` for Mac or `BitMatch-iPad` for iPad or iPhone.
+3. For an iPad or iPhone device build, set your development team in Signing & Capabilities.
 4. Build and run.
 
 Tests, from the repository root:
@@ -134,7 +146,7 @@ CI runs `mac-test` and `ipad-build` on pushes and pull requests.
 
 **Will it work with my camera?** Probably. I personally shoot Sony, so that's the path I've beaten on. Detection for the other brands is in there, but that isn't the same as testing every camera. Open an issue if yours gives you trouble.
 
-**Does it work on iPad?** Yes. It uses the Files app for external drives. Build from source for now; remote uploads are a Mac task.
+**Does it work on iPad and iPhone?** Both are core targets. They use the Files app for folder access. Build from source for now, and keep the app open during transfers; remote uploads are a Mac task.
 
 **Why open source?** So you can trust it. The code is here. Read it before you trust your footage to it.
 

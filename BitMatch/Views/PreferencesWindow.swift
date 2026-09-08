@@ -105,22 +105,24 @@ struct PreferencesWindow: View {
                 // Verification preferences
                 GroupBox("Verification") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Toggle("Use checksum verification by default", isOn: $coordinator.settingsViewModel.prefs.verifyWithChecksum)
-                            .toggleStyle(.checkbox)
-                        
-                        if coordinator.settingsViewModel.prefs.verifyWithChecksum {
-                            HStack {
-                                Text("Algorithm:")
-                                Picker("", selection: $coordinator.settingsViewModel.prefs.checksumAlgorithm) {
-                                    ForEach(ChecksumAlgorithm.allCases, id: \.self) { algorithm in
-                                        Text(algorithm.rawValue).tag(algorithm)
-                                    }
+                        Text(coordinator.verificationMode == .standard ? "Verified copy · SHA-256" : coordinator.verificationMode.rawValue)
+                            .font(.headline)
+                        DisclosureGroup("Advanced verification") {
+                            Picker("Verification", selection: $coordinator.verificationMode) {
+                                ForEach(VerificationMode.allCases) { mode in
+                                    Text(mode.rawValue).tag(mode)
                                 }
-                                .pickerStyle(.menu)
-                                .frame(width: 120)
-                                Spacer()
+                            }
+                            .onChange(of: coordinator.verificationMode) { _, _ in coordinator.saveVerificationMode() }
+                            Text(coordinator.verificationMode.description)
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            if coordinator.verificationMode == .quick {
+                                Label("File contents are not verified in Quick mode.", systemImage: "exclamationmark.triangle.fill")
+                                    .foregroundColor(.orange)
                             }
                         }
+
                     }
                     .padding(8)
                 }

@@ -127,3 +127,42 @@ enum ResultPresentation {
         return visibleIssues + newestSuccesses
     }
 }
+
+/// Summaries describe retained result evidence, never infer completion from an empty list.
+struct DestinationResultSummary: Identifiable {
+    let id: String
+    let title: String
+    let rows: [ResultRow]
+
+    var issueCount: Int { rows.filter { !$0.isSuccessStatus }.count }
+    var unverifiedCount: Int { rows.filter { $0.isSuccessStatus && ($0.checksum?.isEmpty != false || $0.status.contains("Copied")) }.count }
+    var needsAttention: Bool { rows.isEmpty || issueCount > 0 || unverifiedCount > 0 }
+    var detail: String {
+        guard !rows.isEmpty else { return "No file results recorded" }
+        if issueCount > 0 { return "\(issueCount) of \(rows.count) reported results need attention" }
+        if unverifiedCount > 0 { return "\(unverifiedCount) of \(rows.count) file results are unverified" }
+        return "\(rows.count) verified file results"
+    }
+
+    static func make(rows: [ResultRow], destinations: [URL]) -> [Self] {
+        let roots = destinations.sorted { $0.path.count > $1.path.count }
+        var assigned: [String: [ResultRow]] = [:]
+        var remaining: [ResultRow] = []
+        for row in rows {
+            if let path = row.destinationPath,
+               let root = roots.first(where: { path == $0.path || path.hasPrefix($0.path + "/") }) {
+                assigned[root.path, default: []].append(row)
+            } else {
+                remaining.append(row)
+            }
+        }
+        var summaries = destinations.map { root in
+            Self(id: root.path, title: root.lastPathComponent, rows: assigned[root.path] ?? [])
+        }
+        let groups = Dictionary(grouping: remaining) { $0.destination ?? "Other results" }
+        summaries += groups.keys.sorted().map { name in
+            Self(id: "reported:" + name, title: name, rows: groups[name] ?? [])
+        }
+        return summaries
+    }
+}

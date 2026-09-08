@@ -1,0 +1,11 @@
+/var/folders/6d/gq8l_32j6wb_sqwh6q8gsy_w0000gq/T/bitmatch-ascmhl-check.JOaLYb/media/ascmhl/0001_BitMatch_2026-09-08_101121Z.mhl
+validated: /var/folders/6d/gq8l_32j6wb_sqwh6q8gsy_w0000gq/T//bitmatch-ascmhl-check.JOaLYb/media/ascmhl/0001_BitMatch_2026-09-08_101121Z.mhl
+validated: /var/folders/6d/gq8l_32j6wb_sqwh6q8gsy_w0000gq/T//bitmatch-ascmhl-check.JOaLYb/media/ascmhl/ascmhl_chain.xml
+check folder at path: /var/folders/6d/gq8l_32j6wb_sqwh6q8gsy_w0000gq/T//bitmatch-ascmhl-check.JOaLYb/media
+verification (md5) of file Camera A/clip & café.txt: OK
+check folder at path: /var/folders/6d/gq8l_32j6wb_sqwh6q8gsy_w0000gq/T//bitmatch-ascmhl-check.JOaLYb/media
+verification (md5) of file Camera A/clip & café.txt: OK
+PASS: official schemas, byte verification, chain C4, and next-generation interoperability
+ERROR: hash mismatch        for Camera A/clip & café.txt old md5: d5c4370f48d86076c9c0ba937db6f1a3, new md5: 88ed91fad91b8b69b62ce17ae542ff45
+Error: Verification of files referenced in the ASC MHL history failed
+PASS: reference verifier rejects modified media
