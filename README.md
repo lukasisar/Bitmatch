@@ -138,9 +138,26 @@ bash test.sh mac-build      # macOS Debug build
 bash test.sh ipad-build     # iPad simulator Debug build
 bash test.sh ipad-test      # requires IOS_SIMULATOR_DESTINATION
 bash test.sh release-builds # macOS and iPad Release builds
+bash test.sh worker-build   # headless macOS transfer worker
+bash test.sh worker-test    # worker protocol and safety fixtures
 ```
 
 The CI workflow is included, but GitHub Actions is currently disabled. Run `mac-test` and `ipad-build` locally before submitting changes.
+
+## Headless transfer worker
+
+The fork also contains an isolated macOS command-line boundary for machine-run,
+checksum-verified transfers:
+
+```bash
+.build/debug/bitmatch-transfer-worker capabilities --json
+.build/debug/bitmatch-transfer-worker run --job /path/job.json --evidence /path/evidence.json
+```
+
+It reuses BitMatch's hardened copy/verify core, never consults GUI preferences
+to weaken verification, and has no project-database or card-clearing authority.
+See [the V1 protocol contract](docs/TRANSFER_WORKER_PROTOCOL.md) and
+[upstream provenance](UPSTREAM.md).
 
 ## FAQ
 

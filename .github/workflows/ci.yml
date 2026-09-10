@@ -8,6 +8,15 @@ env:
   DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
 
 jobs:
+  transfer-worker:
+    runs-on: macos-15
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - run: xcodebuild -version
+      - run: bash test.sh worker-build
+      - run: bash test.sh worker-test
+
   mac-tests:
     runs-on: macos-15
     timeout-minutes: 12

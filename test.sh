@@ -31,8 +31,14 @@ case "$JOB" in
     run_xcodebuild mac-release build -scheme BitMatch -configuration Release -destination 'platform=macOS'
     run_xcodebuild ipad-release build -scheme BitMatch-iPad -configuration Release -sdk iphonesimulator -destination 'generic/platform=iOS Simulator'
     ;;
+  worker-build)
+    swift build --product bitmatch-transfer-worker
+    ;;
+  worker-test)
+    swift test
+    ;;
   *)
-    echo "Usage: $0 {mac-test|mac-build|ipad-build|ipad-test|release-builds}" >&2
+    echo "Usage: $0 {mac-test|mac-build|ipad-build|ipad-test|release-builds|worker-build|worker-test}" >&2
     exit 64
     ;;
 esac
