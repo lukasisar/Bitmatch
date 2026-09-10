@@ -121,7 +121,10 @@ struct TransferPlanPresentationTests {
             warnings: []
         )
 
-        #expect(plan.sourceDetail == "1,234 files · 1 GB")
+        let countFormatter = NumberFormatter()
+        countFormatter.numberStyle = .decimal
+        let expectedCount = countFormatter.string(from: NSNumber(value: 1_234)) ?? "1234"
+        #expect(plan.sourceDetail == "\(expectedCount) files · 1 GB")
         #expect(plan.optionSummary.contains("Camera label: B Cam"))
         #expect(plan.optionSummary.contains("Reports: PDF"))
     }
