@@ -97,15 +97,55 @@ private actor DetailEvidenceWriter {
 
 }
 
+private final class WorkerDurabilityFactsCollector: TransferDurabilityRecorder, @unchecked Sendable {
+    struct Snapshot {
+        var copy: TransferCopyDurabilityFacts?
+        var readback: TransferReadbackFacts?
+    }
+
+    private let lock = NSLock()
+    private var facts: [String: Snapshot] = [:]
+
+    func recordCopyFacts(_ copyFacts: TransferCopyDurabilityFacts, destinationPath: String) {
+        lock.lock()
+        facts[destinationPath, default: Snapshot()].copy = copyFacts
+        lock.unlock()
+    }
+
+    func recordReadbackFacts(_ readbackFacts: TransferReadbackFacts, destinationPath: String) {
+        lock.lock()
+        facts[destinationPath, default: Snapshot()].readback = readbackFacts
+        lock.unlock()
+    }
+
+    func snapshot(destinationPath: String) -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return facts[destinationPath] ?? Snapshot()
+    }
+}
+
 public struct TransferWorkerRuntime {
     public static let supportedCapabilities = [
         "atomic-no-overwrite",
         "bounded-detail-evidence",
+        "darwin-full-fsync-facts",
+        "directory-publication-flush",
+        "full-destination-readback",
+        "os-cache-bypass-request",
         "sha256-verification",
         "source-read-only",
     ]
 
-    public init() {}
+    private let durabilityIO: any TransferDurabilityIO
+
+    public init() {
+        self.durabilityIO = DarwinTransferDurabilityIO()
+    }
+
+    init(durabilityIO: any TransferDurabilityIO) {
+        self.durabilityIO = durabilityIO
+    }
 
     public func capabilities() -> TransferWorkerCapabilities {
         TransferWorkerCapabilities(
@@ -127,7 +167,13 @@ public struct TransferWorkerRuntime {
         let startedAt = Date()
         let sourceURL = URL(fileURLWithPath: job.sourceRoot, isDirectory: true).standardizedFileURL
         let detailsURL = URL(fileURLWithPath: evidenceURL.path + ".details.jsonl")
-        var sourceSummary = SourceEvidenceSummary(executionRoot: sourceURL.path, fileCount: 0, totalBytes: 0)
+        var sourceSummary = SourceEvidenceSummary(
+            executionRoot: sourceURL.path,
+            fileCount: 0,
+            totalBytes: 0,
+            stabilityVerifiedFiles: 0,
+            stabilityFailedFiles: 0
+        )
         var summaries = emptyDestinationSummaries(for: job)
 
         do {
@@ -153,7 +199,9 @@ public struct TransferWorkerRuntime {
             sourceSummary = SourceEvidenceSummary(
                 executionRoot: sourceURL.path,
                 fileCount: manifest.count,
-                totalBytes: totalBytes
+                totalBytes: totalBytes,
+                stabilityVerifiedFiles: 0,
+                stabilityFailedFiles: 0
             )
 
             let destinationURLs = job.destinations.map { URL(fileURLWithPath: $0.executionRoot, isDirectory: true).standardizedFileURL }
@@ -175,10 +223,13 @@ public struct TransferWorkerRuntime {
 
             let encoder = Self.makeDetailEncoder()
             let writer = try DetailEvidenceWriter(finalURL: detailsURL, encoder: encoder)
+            let durabilityFacts = WorkerDurabilityFactsCollector()
             let service = SharedFileOperationsService(
                 fileSystem: HeadlessFileSystemService(),
                 checksum: SharedChecksumService.shared,
-                pipelineVerification: true
+                pipelineVerification: true,
+                durabilityIO: durabilityIO,
+                durabilityRecorder: durabilityFacts
             )
 
             do {
@@ -197,7 +248,8 @@ public struct TransferWorkerRuntime {
                         let record = makeFileEvidence(
                             result: result,
                             sourceURL: sourceURL,
-                            destinations: job.destinations
+                            destinations: job.destinations,
+                            facts: durabilityFacts.snapshot(destinationPath: result.destinationURL.path)
                         )
                         let recorded = await writer.append(record)
                         if !recorded {
@@ -212,10 +264,28 @@ public struct TransferWorkerRuntime {
                         userInfo: [NSLocalizedDescriptionKey: callbackFailure]
                     )
                 }
-                summaries = makeDestinationSummaries(operation: operation, job: job, sourceURL: sourceURL)
-                let errors = makeErrors(operation: operation, job: job, sourceURL: sourceURL)
+                let sourceStableAcrossAttempt = sourceManifestRemainedStable(manifest, sourceURL: sourceURL)
+                summaries = makeDestinationSummaries(
+                    operation: operation,
+                    job: job,
+                    sourceURL: sourceURL,
+                    facts: durabilityFacts
+                )
+                sourceSummary = makeSourceSummary(
+                    sourceSummary,
+                    operation: operation,
+                    facts: durabilityFacts,
+                    sourceStableAcrossAttempt: sourceStableAcrossAttempt
+                )
+                var errors = makeErrors(operation: operation, job: job, sourceURL: sourceURL)
+                if !sourceStableAcrossAttempt {
+                    errors.append(WorkerTypedError(code: "source-mutated", message: "Source manifest changed during the transfer attempt"))
+                }
                 let detailReference = try await writer.publish()
                 let status: TransferTerminalStatus = errors.isEmpty ? .succeeded : .completedWithFailures
+                let outcome = sourceStableAcrossAttempt
+                    ? aggregateOutcome(operation: operation, facts: durabilityFacts)
+                    : .failed
                 let evidence = makeEvidence(
                     job: job,
                     startedAt: startedAt,
@@ -224,11 +294,13 @@ public struct TransferWorkerRuntime {
                     destinations: summaries,
                     verificationPolicyUsed: "sha256",
                     detailReference: detailReference,
-                    errors: errors
+                    errors: errors,
+                    verificationOutcome: outcome,
+                    warnings: makeDegradationWarnings(operation: operation, facts: durabilityFacts)
                 )
                 try Self.writeEvidenceAtomically(evidence, to: evidenceURL)
                 return TransferWorkerRunResult(
-                    exitCode: errors.isEmpty ? .success : .completedWithFailures,
+                    exitCode: outcome == .failed ? .completedWithFailures : .success,
                     evidence: evidence,
                     diagnostic: nil
                 )
@@ -407,7 +479,9 @@ public struct TransferWorkerRuntime {
         destinations: [DestinationEvidenceSummary],
         verificationPolicyUsed: String?,
         detailReference: DetailEvidenceReference?,
-        errors: [WorkerTypedError]
+        errors: [WorkerTypedError],
+        verificationOutcome: WorkerVerificationOutcome = .failed,
+        warnings: [String] = []
     ) -> TransferEvidence {
         TransferEvidence(
             protocolVersion: TransferWorkerIdentity.protocolVersion,
@@ -420,11 +494,12 @@ public struct TransferWorkerRuntime {
             startedAt: startedAt,
             endedAt: Date(),
             terminalStatus: status,
+            verificationOutcome: verificationOutcome,
             source: source,
             destinations: destinations,
             verificationPolicyUsed: verificationPolicyUsed,
             detailEvidence: detailReference,
-            warnings: [],
+            warnings: warnings,
             errors: errors,
             capabilitiesUsed: verificationPolicyUsed == nil ? [] : Self.supportedCapabilities
         )
@@ -438,7 +513,10 @@ public struct TransferWorkerRuntime {
                 role: $0.role,
                 successfulFiles: 0,
                 failedFiles: 0,
-                verifiedBytes: 0
+                verifiedBytes: 0,
+                verificationOutcome: .failed,
+                strongFiles: 0,
+                degradedFiles: 0
             )
         }
     }
@@ -446,11 +524,15 @@ public struct TransferWorkerRuntime {
     private func makeDestinationSummaries(
         operation: FileOperation,
         job: TransferJobSpec,
-        sourceURL: URL
+        sourceURL: URL,
+        facts: WorkerDurabilityFactsCollector
     ) -> [DestinationEvidenceSummary] {
         job.destinations.map { destination in
             let matching = operation.results.filter {
                 destinationRequestID(for: $0.destinationURL, destinations: job.destinations) == destination.requestID
+            }
+            let outcomes = matching.map {
+                fileOutcome(result: $0, facts: facts.snapshot(destinationPath: $0.destinationURL.path))
             }
             return DestinationEvidenceSummary(
                 requestID: destination.requestID,
@@ -458,16 +540,139 @@ public struct TransferWorkerRuntime {
                 role: destination.role,
                 successfulFiles: matching.filter(\.success).count,
                 failedFiles: matching.filter { !$0.success }.count,
-                verifiedBytes: matching.filter(\.success).reduce(0) { $0 + $1.fileSize }
+                verifiedBytes: matching.filter(\.success).reduce(0) { $0 + $1.fileSize },
+                verificationOutcome: aggregate(outcomes),
+                strongFiles: outcomes.filter { $0 == .verifiedStrong }.count,
+                degradedFiles: outcomes.filter { $0 == .verifiedDegraded }.count
             )
         }
+    }
+
+    private func makeSourceSummary(
+        _ base: SourceEvidenceSummary,
+        operation: FileOperation,
+        facts: WorkerDurabilityFactsCollector,
+        sourceStableAcrossAttempt: Bool
+    ) -> SourceEvidenceSummary {
+        guard sourceStableAcrossAttempt else {
+            return SourceEvidenceSummary(
+                executionRoot: base.executionRoot,
+                fileCount: base.fileCount,
+                totalBytes: base.totalBytes,
+                stabilityVerifiedFiles: 0,
+                stabilityFailedFiles: base.fileCount
+            )
+        }
+        let grouped = Dictionary(grouping: operation.results, by: { $0.sourceURL.path })
+        let stable = grouped.values.filter { results in
+            !results.isEmpty && results.allSatisfy { result in
+                let snapshot = facts.snapshot(destinationPath: result.destinationURL.path)
+                return snapshot.copy?.sourceRemainedStable == true
+                    && snapshot.readback?.sourceRemainedStable == true
+            }
+        }.count
+        return SourceEvidenceSummary(
+            executionRoot: base.executionRoot,
+            fileCount: base.fileCount,
+            totalBytes: base.totalBytes,
+            stabilityVerifiedFiles: stable,
+            stabilityFailedFiles: max(0, base.fileCount - stable)
+        )
+    }
+
+    private func sourceManifestRemainedStable(_ initial: [FileEntry], sourceURL: URL) -> Bool {
+        guard let final = try? FileTreeEnumerator.enumerateRegularFiles(base: sourceURL),
+              final.count == initial.count else { return false }
+        let initialFacts = initial.map { ($0.relativePath, $0.size, $0.modificationDate) }.sorted { $0.0 < $1.0 }
+        let finalFacts = final.map { ($0.relativePath, $0.size, $0.modificationDate) }.sorted { $0.0 < $1.0 }
+        return zip(initialFacts, finalFacts).allSatisfy { left, right in
+            left.0 == right.0 && left.1 == right.1 && left.2 == right.2
+        }
+    }
+
+    private func aggregateOutcome(
+        operation: FileOperation,
+        facts: WorkerDurabilityFactsCollector
+    ) -> WorkerVerificationOutcome {
+        aggregate(operation.results.map {
+            fileOutcome(result: $0, facts: facts.snapshot(destinationPath: $0.destinationURL.path))
+        })
+    }
+
+    private func aggregate(_ outcomes: [WorkerVerificationOutcome]) -> WorkerVerificationOutcome {
+        guard !outcomes.isEmpty else { return .failed }
+        if outcomes.contains(.failed) { return .failed }
+        if outcomes.contains(.verifiedDegraded) { return .verifiedDegraded }
+        return .verifiedStrong
+    }
+
+    private func fileOutcome(
+        result: FileOperationResult,
+        facts: WorkerDurabilityFactsCollector.Snapshot
+    ) -> WorkerVerificationOutcome {
+        guard result.success,
+              result.verificationResult?.matches == true,
+              let copy = facts.copy,
+              let readback = facts.readback,
+              copy.sourceRemainedStable,
+              readback.sourceRemainedStable,
+              readback.fullReadPerformed else {
+            return .failed
+        }
+
+        if copy.reusedExistingDestination {
+            return operationSucceeded(readback.cacheBypass) ? .verifiedDegraded : operationDegraded(readback.cacheBypass) ? .verifiedDegraded : .failed
+        }
+
+        guard copy.ordinaryFlushSucceeded,
+              copy.prePublicationChecksumMatched,
+              copy.publicationSucceeded else { return .failed }
+        let required = [copy.fullSync, copy.directorySync, readback.cacheBypass]
+        if required.allSatisfy(operationSucceeded) { return .verifiedStrong }
+        if required.allSatisfy({ operationSucceeded($0) || operationDegraded($0) }) {
+            return .verifiedDegraded
+        }
+        return .failed
+    }
+
+    private func operationSucceeded(_ outcome: TransferSystemCallOutcome?) -> Bool {
+        if case .succeeded? = outcome { return true }
+        return false
+    }
+
+    private func operationDegraded(_ outcome: TransferSystemCallOutcome?) -> Bool {
+        if case .unsupported? = outcome { return true }
+        return false
+    }
+
+    private func makeDegradationWarnings(
+        operation: FileOperation,
+        facts: WorkerDurabilityFactsCollector
+    ) -> [String] {
+        var warnings = Set<String>()
+        for result in operation.results where result.success {
+            let snapshot = facts.snapshot(destinationPath: result.destinationURL.path)
+            if snapshot.copy?.reusedExistingDestination == true {
+                warnings.insert("A matching pre-existing destination was reused; this attempt cannot attest its original durability flush or publication.")
+            }
+            if operationDegraded(snapshot.copy?.fullSync) {
+                warnings.insert("F_FULLFSYNC was unsupported; ordinary fsync is recorded but is not treated as equivalent strong durability.")
+            }
+            if operationDegraded(snapshot.copy?.directorySync) {
+                warnings.insert("Destination directory metadata fsync was unsupported; publication durability is degraded.")
+            }
+            if operationDegraded(snapshot.readback?.cacheBypass) {
+                warnings.insert("F_NOCACHE was unsupported; full readback completed without an OS-cache-bypass request.")
+            }
+        }
+        return warnings.sorted()
     }
 
     private func makeErrors(operation: FileOperation, job: TransferJobSpec, sourceURL: URL) -> [WorkerTypedError] {
         operation.results.compactMap { result in
             guard !result.success else { return nil }
             return WorkerTypedError(
-                code: "file-failure",
+                code: workerErrorCode(for: result),
                 message: result.error?.localizedDescription ?? "Verification failed",
                 destinationRequestID: destinationRequestID(for: result.destinationURL, destinations: job.destinations),
                 relativePath: try? RelativePathResolver(base: sourceURL).resolve(result.sourceURL)
@@ -527,16 +732,50 @@ private func destinationRequestID(for fileURL: URL, destinations: [DestinationRe
 private func makeFileEvidence(
     result: FileOperationResult,
     sourceURL: URL,
-    destinations: [DestinationRequest]
+    destinations: [DestinationRequest],
+    facts: WorkerDurabilityFactsCollector.Snapshot
 ) -> FileEvidenceRecord {
     let destinationID = destinationRequestID(for: result.destinationURL, destinations: destinations) ?? "unknown"
     let relativePath = (try? RelativePathResolver(base: sourceURL).resolve(result.sourceURL)) ?? result.sourceURL.lastPathComponent
     let typedError = result.success ? nil : WorkerTypedError(
-        code: "file-failure",
+        code: workerErrorCode(for: result),
         message: result.error?.localizedDescription ?? "Verification failed",
         destinationRequestID: destinationID,
         relativePath: relativePath
     )
+    let copy = facts.copy ?? TransferCopyDurabilityFacts()
+    let readback = facts.readback ?? TransferReadbackFacts()
+    let outcome: WorkerVerificationOutcome
+    if !result.success || result.verificationResult?.matches != true {
+        outcome = .failed
+    } else if copy.reusedExistingDestination,
+              readback.fullReadPerformed,
+              readback.sourceRemainedStable,
+              operationFact(readback.cacheBypass).status != .failed {
+        outcome = .verifiedDegraded
+    } else if copy.ordinaryFlushSucceeded,
+              copy.prePublicationChecksumMatched,
+              copy.publicationSucceeded,
+              copy.sourceRemainedStable,
+              readback.fullReadPerformed,
+              readback.sourceRemainedStable,
+              operationFact(copy.fullSync).status == .succeeded,
+              operationFact(copy.directorySync).status == .succeeded,
+              operationFact(readback.cacheBypass).status == .succeeded {
+        outcome = .verifiedStrong
+    } else if copy.ordinaryFlushSucceeded,
+              copy.prePublicationChecksumMatched,
+              copy.publicationSucceeded,
+              copy.sourceRemainedStable,
+              readback.fullReadPerformed,
+              readback.sourceRemainedStable,
+              ![operationFact(copy.fullSync), operationFact(copy.directorySync), operationFact(readback.cacheBypass)]
+                .contains(where: { $0.status == .failed || $0.status == .notRequested }) {
+        outcome = .verifiedDegraded
+    } else {
+        outcome = .failed
+    }
+
     return FileEvidenceRecord(
         destinationRequestID: destinationID,
         relativePath: relativePath,
@@ -545,7 +784,55 @@ private func makeFileEvidence(
         checksumAlgorithm: result.verificationResult?.checksumType.rawValue,
         sourceChecksum: result.verificationResult?.sourceChecksum,
         destinationChecksum: result.verificationResult?.destinationChecksum,
+        verificationOutcome: outcome,
+        sourceStableDuringReads: copy.sourceRemainedStable && readback.sourceRemainedStable,
+        prePublicationChecksumMatched: copy.prePublicationChecksumMatched,
+        fullDestinationReadbackPerformed: readback.fullReadPerformed,
+        destinationReadbackBytes: readback.bytesRead,
+        cacheBypass: operationFact(readback.cacheBypass),
+        durabilityFlush: operationFact(copy.fullSync),
+        directoryMetadataFlush: operationFact(copy.directorySync),
+        publication: copy.reusedExistingDestination ? .reusedExisting : copy.publicationSucceeded ? .published : .notPublished,
         error: typedError
     )
+}
+
+private func workerErrorCode(for result: FileOperationResult) -> String {
+    if result.verificationResult?.matches == false || (result.error == nil && !result.success) {
+        return "checksum-mismatch"
+    }
+    let error = result.error as NSError?
+    let message = error?.localizedDescription.lowercased() ?? ""
+    if error?.domain == "BitMatchTransferWorker.Readback" {
+        switch error?.code {
+        case -2: return "source-mutated"
+        case -3: return "short-readback"
+        case -4: return "destination-mutated"
+        default: return "readback-failed"
+        }
+    }
+    if error?.domain == "BitMatchTransferWorker.Durability" {
+        if message.contains("f_fullfsync") { return "full-sync-failed" }
+        if message.contains("f_nocache") { return "cache-bypass-failed" }
+        if message.contains("directory") { return "directory-flush-failed" }
+        return "durability-failed"
+    }
+    if message.contains("appeared during copy") { return "publication-collision" }
+    if message.contains("source file changed") { return "source-mutated" }
+    if error?.domain == NSPOSIXErrorDomain, error?.code == Int(ENOENT) { return "destination-disappeared" }
+    return "io-failure"
+}
+
+private func operationFact(_ outcome: TransferSystemCallOutcome?) -> WorkerOperationFact {
+    switch outcome {
+    case .none:
+        return WorkerOperationFact(status: .notRequested)
+    case .succeeded:
+        return WorkerOperationFact(status: .succeeded)
+    case .unsupported(let code, let message):
+        return WorkerOperationFact(status: .unsupported, errorCode: code, errorMessage: message)
+    case .failed(let code, let message):
+        return WorkerOperationFact(status: .failed, errorCode: code, errorMessage: message)
+    }
 }
 #endif

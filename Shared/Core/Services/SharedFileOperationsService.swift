@@ -213,6 +213,8 @@ class SharedFileOperationsService: FileOperationsService {
     private let fileSystem: FileSystemService
     private let checksumService: any ChecksumService
     private let pipelineVerification: Bool
+    private let durabilityIO: (any TransferDurabilityIO)?
+    private let durabilityRecorder: (any TransferDurabilityRecorder)?
     /// Test seam invoked with the raw destination URL immediately before that
     /// destination is pinned. It performs no filesystem work in production
     /// (nil); tests use it to block or fail destination setup deterministically.
@@ -240,12 +242,16 @@ class SharedFileOperationsService: FileOperationsService {
         fileSystem: FileSystemService,
         checksum: any ChecksumService,
         pipelineVerification: Bool = !UserDefaults.standard.bool(forKey: "DisablePipelinedVerify"),
-        destinationSetupHook: (@Sendable (URL) throws -> Void)? = nil
+        destinationSetupHook: (@Sendable (URL) throws -> Void)? = nil,
+        durabilityIO: (any TransferDurabilityIO)? = nil,
+        durabilityRecorder: (any TransferDurabilityRecorder)? = nil
     ) {
         self.fileSystem = fileSystem
         self.checksumService = checksum
         self.pipelineVerification = pipelineVerification
         self.destinationSetupHook = destinationSetupHook
+        self.durabilityIO = durabilityIO
+        self.durabilityRecorder = durabilityRecorder
     }
     
     // MARK: - FileOperationsService Protocol Implementation
@@ -531,6 +537,8 @@ class SharedFileOperationsService: FileOperationsService {
                 verificationMode: operation.verificationMode,
                 workers: copyWorkers,
                 checksumService: self.checksumService,
+                durabilityIO: durabilityIO,
+                durabilityRecorder: durabilityRecorder,
                 preEnumeratedFiles: sourceFileURLs,
                 pauseCheck: {
                     try await pauseState.waitIfPaused()
@@ -580,7 +588,9 @@ class SharedFileOperationsService: FileOperationsService {
                                         pinnedRoot: pinnedDestination,
                                         relativePath: relativePath,
                                         verificationMode: mode,
-                                        checksumService: self.checksumService
+                                        checksumService: self.checksumService,
+                                        durabilityIO: self.durabilityIO,
+                                        durabilityRecorder: self.durabilityRecorder
                                     )
                                     let verified = FileOperationResult(
                                         sourceURL: srcURL,
@@ -784,7 +794,9 @@ class SharedFileOperationsService: FileOperationsService {
                                 pinnedRoot: pinnedDestination,
                                 relativePath: relativePath,
                                 verificationMode: operation.verificationMode,
-                                checksumService: self.checksumService
+                                checksumService: self.checksumService,
+                                durabilityIO: self.durabilityIO,
+                                durabilityRecorder: self.durabilityRecorder
                             )
                             
                             let fileSize = sizeForVerify

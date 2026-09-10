@@ -5,6 +5,102 @@ import CryptoKit
 #if canImport(Darwin)
 import Darwin
 
+enum TransferSystemCallOutcome: Equatable, Sendable {
+    case succeeded
+    case unsupported(code: Int32, message: String)
+    case failed(code: Int32, message: String)
+}
+
+struct TransferCopyDurabilityFacts: Equatable, Sendable {
+    var ordinaryFlushSucceeded = false
+    var fullSync: TransferSystemCallOutcome?
+    var prePublicationChecksumMatched = false
+    var publicationSucceeded = false
+    var reusedExistingDestination = false
+    var directorySync: TransferSystemCallOutcome?
+    var sourceRemainedStable = false
+}
+
+struct TransferReadbackFacts: Equatable, Sendable {
+    var cacheBypass: TransferSystemCallOutcome?
+    var fullReadPerformed = false
+    var bytesRead: Int64 = 0
+    var sourceRemainedStable = false
+}
+
+protocol TransferDurabilityIO: Sendable {
+    func fullSync(fileDescriptor: Int32) -> TransferSystemCallOutcome
+    func syncDirectory(fileDescriptor: Int32) -> TransferSystemCallOutcome
+    func requestCacheBypass(fileDescriptor: Int32) -> TransferSystemCallOutcome
+    func readDestination(fileDescriptor: Int32, maximumCount: Int) throws -> Data
+    func prepareForPublication(destinationPath: String) throws
+    func prepareForSourceVerification(sourcePath: String) throws
+}
+
+protocol TransferDurabilityRecorder: Sendable {
+    func recordCopyFacts(_ facts: TransferCopyDurabilityFacts, destinationPath: String)
+    func recordReadbackFacts(_ facts: TransferReadbackFacts, destinationPath: String)
+}
+
+struct DarwinTransferDurabilityIO: TransferDurabilityIO {
+    func prepareForPublication(destinationPath: String) throws {}
+    func prepareForSourceVerification(sourcePath: String) throws {}
+
+    func fullSync(fileDescriptor: Int32) -> TransferSystemCallOutcome {
+        let result = Darwin.fcntl(fileDescriptor, F_FULLFSYNC)
+        return Self.outcome(result: result, unsupportedCodes: [EINVAL, ENOTSUP, ENOTTY])
+    }
+
+    func syncDirectory(fileDescriptor: Int32) -> TransferSystemCallOutcome {
+        let result = Darwin.fsync(fileDescriptor)
+        return Self.outcome(result: result, unsupportedCodes: [EINVAL, ENOTSUP])
+    }
+
+    func requestCacheBypass(fileDescriptor: Int32) -> TransferSystemCallOutcome {
+        let result = Darwin.fcntl(fileDescriptor, F_NOCACHE, 1)
+        return Self.outcome(result: result, unsupportedCodes: [EINVAL, ENOTSUP, ENOTTY])
+    }
+
+    func readDestination(fileDescriptor: Int32, maximumCount: Int) throws -> Data {
+        var buffer = [UInt8](repeating: 0, count: maximumCount)
+        let count = Darwin.read(fileDescriptor, &buffer, maximumCount)
+        guard count >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Destination readback failed: " + String(cString: strerror(errno))]
+            )
+        }
+        return Data(buffer.prefix(count))
+    }
+
+    private static func outcome(result: Int32, unsupportedCodes: Set<Int32>) -> TransferSystemCallOutcome {
+        guard result != 0 else { return .succeeded }
+        let code = errno
+        let message = String(cString: strerror(code))
+        return unsupportedCodes.contains(code)
+            ? .unsupported(code: code, message: message)
+            : .failed(code: code, message: message)
+    }
+}
+
+private enum TransferDurabilityError {
+    static func syscall(_ operation: String, outcome: TransferSystemCallOutcome) -> NSError {
+        let details: (Int32, String)
+        switch outcome {
+        case .succeeded:
+            details = (0, "Unexpected successful result")
+        case .unsupported(let code, let message), .failed(let code, let message):
+            details = (code, message)
+        }
+        return NSError(
+            domain: "BitMatchTransferWorker.Durability",
+            code: Int(details.0),
+            userInfo: [NSLocalizedDescriptionKey: "\(operation) failed: \(details.1)"]
+        )
+    }
+}
+
 /// Owns an already-open destination directory.  All writes below this point use
 /// descriptor-relative calls so renaming a pathname after setup cannot redirect
 /// a copy outside the selected destination.
@@ -85,7 +181,7 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
     }
 
     static func createTemporaryFile(named name: String, relativeTo parentFD: Int32) throws -> Int32 {
-        let flags = O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
+        let flags = O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC
         let fd = name.withCString { openat(parentFD, $0, flags, 0o600) }
         guard fd >= 0 else { throw posixError("Unable to create temporary destination file") }
         return fd
@@ -250,6 +346,19 @@ final class PinnedDestinationFile: @unchecked Sendable {
             throw FileCopyService.existingDestinationConflictError("Pinned destination file changed before reading")
         }
         return FileHandle(fileDescriptor: readerFD, closeOnDealloc: true)
+    }
+
+    func independentReadingDescriptor() throws -> (descriptor: Int32, expected: stat) {
+        let expected = try snapshot()
+        let readerFD = try Self.openRegularFile(named: name, relativeTo: parentFD)
+        var actual = stat()
+        guard fstat(readerFD, &actual) == 0,
+              actual.st_dev == expected.st_dev,
+              actual.st_ino == expected.st_ino else {
+            _ = Darwin.close(readerFD)
+            throw FileCopyService.existingDestinationConflictError("Pinned destination file changed before readback")
+        }
+        return (readerFD, expected)
     }
 
     private static func openRegularFile(named name: String, relativeTo parentFD: Int32) throws -> Int32 {
@@ -459,6 +568,8 @@ final class FileCopyService {
         verificationMode: VerificationMode,
         workers: Int,
         checksumService: any ChecksumService,
+        durabilityIO: (any TransferDurabilityIO)? = nil,
+        durabilityRecorder: (any TransferDurabilityRecorder)? = nil,
         preEnumeratedFiles: [URL]? = nil,
         pauseCheck: (@Sendable () async throws -> Void)? = nil,
         onProgress: @escaping (String, Int64) async -> Void,
@@ -524,6 +635,13 @@ final class FileCopyService {
                                     verificationMode: verificationMode,
                                     checksumService: checksumService
                                 ) {
+                                    durabilityRecorder?.recordCopyFacts(
+                                        TransferCopyDurabilityFacts(
+                                            reusedExistingDestination: true,
+                                            sourceRemainedStable: true
+                                        ),
+                                        destinationPath: pinnedRoot.destinationURL(for: relativePath).path
+                                    )
                                     await onProgress(relativePath, sourceSize)
                                     continue
                                 }
@@ -532,6 +650,9 @@ final class FileCopyService {
                                 from: fileURL,
                                 toPinnedParent: parentFD,
                                 filename: filename,
+                                destinationPath: pinnedRoot.destinationURL(for: relativePath).path,
+                                durabilityIO: durabilityIO,
+                                durabilityRecorder: durabilityRecorder,
                                 pauseCheck: pauseCheck
                             )
                             await onProgress(relativePath, sourceSize)
@@ -692,10 +813,16 @@ final class FileCopyService {
         from source: URL,
         toPinnedParent parentFD: Int32,
         filename: String,
+        destinationPath: String,
+        durabilityIO: (any TransferDurabilityIO)?,
+        durabilityRecorder: (any TransferDurabilityRecorder)?,
         pauseCheck: (@Sendable () async throws -> Void)?
     ) async throws {
-        let fm = FileManager.default
-        let sourceHandle = try FileHandle(forReadingFrom: source)
+        let sourceFD = source.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard sourceFD >= 0 else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to open source read-only"])
+        }
+        let sourceHandle = FileHandle(fileDescriptor: sourceFD, closeOnDealloc: false)
         defer { closeFileHandle(sourceHandle, context: source.path) }
 
         let temporaryName = ".bitmatch.tmp." + UUID().uuidString
@@ -712,11 +839,17 @@ final class FileCopyService {
             }
         }
 
-        let sourceAttributes = try fm.attributesOfItem(atPath: source.path)
-        let sourceSize = (sourceAttributes[.size] as? NSNumber)?.int64Value ?? 0
-        let sourceModificationDate = sourceAttributes[.modificationDate] as? Date
-        let sourceIdentity = fileIdentity(from: sourceAttributes)
+        var sourceInitial = stat()
+        guard fstat(sourceFD, &sourceInitial) == 0, (sourceInitial.st_mode & S_IFMT) == S_IFREG else {
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to inspect opened source file"])
+        }
+        let sourceSize = Int64(sourceInitial.st_size)
+        let sourceModificationDate: Date? = Date(
+            timeIntervalSince1970: TimeInterval(sourceInitial.st_mtimespec.tv_sec)
+                + TimeInterval(sourceInitial.st_mtimespec.tv_nsec) / 1_000_000_000
+        )
         var reachedEOF = false
+        var copiedSourceHasher = SHA256()
         while !reachedEOF {
             try Task.checkCancellation()
             if let pauseCheck { try await pauseCheck() }
@@ -725,6 +858,7 @@ final class FileCopyService {
                 reachedEOF = true
             } else {
                 try destinationHandle.write(contentsOf: data)
+                if durabilityIO != nil { copiedSourceHasher.update(data: data) }
             }
         }
         #if compiler(>=5.7)
@@ -737,20 +871,49 @@ final class FileCopyService {
         destinationHandle.synchronizeFile()
         #endif
 
+        var durabilityFacts = TransferCopyDurabilityFacts(ordinaryFlushSucceeded: true)
+        if let durabilityIO {
+            let fullSync = durabilityIO.fullSync(fileDescriptor: temporaryFD)
+            durabilityFacts.fullSync = fullSync
+            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+            if case .failed = fullSync {
+                throw TransferDurabilityError.syscall("F_FULLFSYNC", outcome: fullSync)
+            }
+
+            guard Darwin.lseek(temporaryFD, 0, SEEK_SET) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to seek temporary destination for pre-publication verification"])
+            }
+            var temporaryHasher = SHA256()
+            var verifiedBytes: Int64 = 0
+            while verifiedBytes < sourceSize {
+                let data = try readDescriptor(
+                    temporaryFD,
+                    maximumCount: Int(min(Int64(1024 * 1024), sourceSize - verifiedBytes))
+                )
+                guard !data.isEmpty else {
+                    throw NSError(domain: "BitMatchTransferWorker.Readback", code: -5, userInfo: [NSLocalizedDescriptionKey: "Short temporary destination read before publication"])
+                }
+                temporaryHasher.update(data: data)
+                verifiedBytes += Int64(data.count)
+            }
+            guard copiedSourceHasher.finalize() == temporaryHasher.finalize() else {
+                throw NSError(domain: "BitMatchTransferWorker.Readback", code: -6, userInfo: [NSLocalizedDescriptionKey: "Temporary destination checksum mismatch before publication"])
+            }
+            durabilityFacts.prePublicationChecksumMatched = true
+            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+        }
+
         var temporaryInfo = stat()
         guard fstat(temporaryFD, &temporaryInfo) == 0,
               Int64(temporaryInfo.st_size) == sourceSize else {
             throw NSError(domain: "FileCopyService", code: -2, userInfo: [NSLocalizedDescriptionKey: "Size mismatch after copy"])
         }
-        let finalSourceAttributes = try fm.attributesOfItem(atPath: source.path)
-        guard sourceRemainedStable(
-            initialSize: sourceSize,
-            initialModificationDate: sourceModificationDate,
-            initialIdentity: sourceIdentity,
-            finalAttributes: finalSourceAttributes
-        ) else {
+        var sourceFinal = stat()
+        guard fstat(sourceFD, &sourceFinal) == 0,
+              pinnedFileRemainedStable(sourceInitial, sourceFinal) else {
             throw NSError(domain: "FileCopyService", code: -4, userInfo: [NSLocalizedDescriptionKey: "Source file changed during copy; destination was not modified"])
         }
+        durabilityFacts.sourceRemainedStable = true
 
         if let sourceModificationDate {
             var times = [timespec(tv_sec: Int(sourceModificationDate.timeIntervalSince1970), tv_nsec: 0),
@@ -761,8 +924,20 @@ final class FileCopyService {
         }
         try destinationHandle.close()
         destinationClosed = true
+        try durabilityIO?.prepareForPublication(destinationPath: destinationPath)
         try PinnedDestinationDirectory.publishTemporaryFile(named: temporaryName, as: filename, relativeTo: parentFD)
         published = true
+        durabilityFacts.publicationSucceeded = true
+        if let durabilityIO {
+            let directorySync = durabilityIO.syncDirectory(fileDescriptor: parentFD)
+            durabilityFacts.directorySync = directorySync
+            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+            if case .failed = directorySync {
+                throw TransferDurabilityError.syscall("destination directory fsync", outcome: directorySync)
+            }
+        } else {
+            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+        }
     }
     #endif
 
@@ -1004,13 +1179,25 @@ final class FileCopyService {
         pinnedRoot: PinnedDestinationDirectory,
         relativePath: String,
         verificationMode: VerificationMode,
-        checksumService: any ChecksumService
+        checksumService: any ChecksumService,
+        durabilityIO: (any TransferDurabilityIO)? = nil,
+        durabilityRecorder: (any TransferDurabilityRecorder)? = nil
     ) async throws -> VerificationResult {
         guard let components = safeRelativeComponents(relativePath) else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
         }
         let destination = try pinnedRoot.openRegularFile(at: components)
         let startTime = Date()
+
+        if verificationMode == .standard, let durabilityIO {
+            return try await durableSHA256Verification(
+                source: source,
+                destination: destination,
+                destinationPath: pinnedRoot.destinationURL(for: relativePath).path,
+                durabilityIO: durabilityIO,
+                durabilityRecorder: durabilityRecorder
+            )
+        }
 
         if verificationMode == .paranoid {
             let matches = try await byteComparison(source: source, pinnedDestination: destination)
@@ -1066,6 +1253,122 @@ final class FileCopyService {
             processingTime: totalProcessing,
             fileSize: base.fileSize
         )
+    }
+
+    private static func durableSHA256Verification(
+        source: URL,
+        destination: PinnedDestinationFile,
+        destinationPath: String,
+        durabilityIO: any TransferDurabilityIO,
+        durabilityRecorder: (any TransferDurabilityRecorder)?
+    ) async throws -> VerificationResult {
+        let startedAt = Date()
+        try durabilityIO.prepareForSourceVerification(sourcePath: source.path)
+        let sourceFD = source.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard sourceFD >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Unable to reopen source read-only for verification"]
+            )
+        }
+        defer { _ = Darwin.close(sourceFD) }
+
+        var sourceInitial = stat()
+        guard fstat(sourceFD, &sourceInitial) == 0, (sourceInitial.st_mode & S_IFMT) == S_IFREG else {
+            throw NSError(domain: "BitMatchTransferWorker.Readback", code: -1, userInfo: [NSLocalizedDescriptionKey: "Unable to inspect opened source file"])
+        }
+
+        var sourceHasher = SHA256()
+        var sourceBytes: Int64 = 0
+        while true {
+            try Task.checkCancellation()
+            let data = try readDescriptor(sourceFD, maximumCount: 1024 * 1024)
+            if data.isEmpty { break }
+            sourceHasher.update(data: data)
+            sourceBytes += Int64(data.count)
+        }
+
+        var sourceFinal = stat()
+        guard fstat(sourceFD, &sourceFinal) == 0,
+              sourceBytes == Int64(sourceInitial.st_size),
+              pinnedFileRemainedStable(sourceInitial, sourceFinal) else {
+            throw NSError(
+                domain: "BitMatchTransferWorker.Readback",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Source file changed during verification read"]
+            )
+        }
+
+        let openedDestination = try destination.independentReadingDescriptor()
+        let destinationFD = openedDestination.descriptor
+        defer { _ = Darwin.close(destinationFD) }
+        var facts = TransferReadbackFacts(sourceRemainedStable: true)
+        let cacheBypass = durabilityIO.requestCacheBypass(fileDescriptor: destinationFD)
+        facts.cacheBypass = cacheBypass
+        durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+        if case .failed = cacheBypass {
+            throw TransferDurabilityError.syscall("F_NOCACHE readback request", outcome: cacheBypass)
+        }
+
+        var destinationHasher = SHA256()
+        while facts.bytesRead < Int64(openedDestination.expected.st_size) {
+            try Task.checkCancellation()
+            if let pauseCheck = SharedChecksumService.pauseCheck { try await pauseCheck() }
+            let remaining = Int64(openedDestination.expected.st_size) - facts.bytesRead
+            let data = try durabilityIO.readDestination(
+                fileDescriptor: destinationFD,
+                maximumCount: Int(min(Int64(1024 * 1024), remaining))
+            )
+            guard !data.isEmpty else {
+                durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+                throw NSError(
+                    domain: "BitMatchTransferWorker.Readback",
+                    code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "Short destination readback: expected \(openedDestination.expected.st_size) bytes, read \(facts.bytesRead)"]
+                )
+            }
+            destinationHasher.update(data: data)
+            facts.bytesRead += Int64(data.count)
+        }
+        let trailing = try durabilityIO.readDestination(fileDescriptor: destinationFD, maximumCount: 1)
+        var destinationFinal = stat()
+        guard trailing.isEmpty,
+              fstat(destinationFD, &destinationFinal) == 0,
+              pinnedFileRemainedStable(openedDestination.expected, destinationFinal) else {
+            durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+            throw NSError(
+                domain: "BitMatchTransferWorker.Readback",
+                code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Destination changed during full readback"]
+            )
+        }
+        facts.fullReadPerformed = true
+        durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+
+        let sourceChecksum = sourceHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let destinationChecksum = destinationHasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return VerificationResult(
+            sourceChecksum: sourceChecksum,
+            destinationChecksum: destinationChecksum,
+            matches: sourceChecksum == destinationChecksum,
+            checksumType: .sha256,
+            processingTime: Date().timeIntervalSince(startedAt),
+            fileSize: Int64(sourceInitial.st_size)
+        )
+    }
+
+    private static func readDescriptor(_ fileDescriptor: Int32, maximumCount: Int) throws -> Data {
+        var buffer = [UInt8](repeating: 0, count: maximumCount)
+        let count = Darwin.read(fileDescriptor, &buffer, maximumCount)
+        guard count >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Source read failed: " + String(cString: strerror(errno))]
+            )
+        }
+        return Data(buffer.prefix(count))
     }
 
     private static func checksumsMatch(

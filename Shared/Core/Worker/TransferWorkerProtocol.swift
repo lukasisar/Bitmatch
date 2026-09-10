@@ -1,11 +1,11 @@
 import Foundation
 
 public enum TransferWorkerIdentity {
-    public static let semanticVersion = "0.1.0"
-    public static let build = "pp-015.1"
+    public static let semanticVersion = "0.2.0"
+    public static let build = "pp-016.1"
     public static let upstreamRepository = "https://github.com/mikecerisano/Bitmatch"
     public static let upstreamRevision = "3debabe2e1049c7e02ee5f3587464894f3b190d5"
-    public static let protocolVersion = 1
+    public static let protocolVersion = 2
 }
 
 public struct TransferWorkerCapabilities: Codable, Equatable, Sendable {
@@ -131,6 +131,53 @@ public enum TransferTerminalStatus: String, Codable, Equatable, Sendable {
     case internalFailure
 }
 
+public enum WorkerVerificationOutcome: String, Codable, Equatable, Sendable {
+    case verifiedStrong = "VERIFIED_STRONG"
+    case verifiedDegraded = "VERIFIED_DEGRADED"
+    case failed = "FAILED"
+}
+
+public enum WorkerOperationStatus: String, Codable, Equatable, Sendable {
+    case notRequested
+    case succeeded
+    case unsupported
+    case failed
+}
+
+public struct WorkerOperationFact: Codable, Equatable, Sendable {
+    public let status: WorkerOperationStatus
+    public let errorCode: Int32?
+    public let errorMessage: String?
+
+    public init(status: WorkerOperationStatus, errorCode: Int32? = nil, errorMessage: String? = nil) {
+        self.status = status
+        self.errorCode = errorCode
+        self.errorMessage = errorMessage
+    }
+
+    public var requested: Bool { status != .notRequested }
+    public var supported: Bool? {
+        switch status {
+        case .notRequested: return nil
+        case .unsupported: return false
+        case .succeeded, .failed: return true
+        }
+    }
+    public var succeeded: Bool? {
+        switch status {
+        case .notRequested, .unsupported: return nil
+        case .succeeded: return true
+        case .failed: return false
+        }
+    }
+}
+
+public enum WorkerPublicationDisposition: String, Codable, Equatable, Sendable {
+    case published
+    case reusedExisting
+    case notPublished
+}
+
 public enum TransferWorkerExitCode: Int32, Codable, Equatable, Sendable {
     case success = 0
     case completedWithFailures = 2
@@ -151,6 +198,7 @@ public struct TransferEvidence: Codable, Equatable, Sendable {
     public let startedAt: Date
     public let endedAt: Date
     public let terminalStatus: TransferTerminalStatus
+    public let verificationOutcome: WorkerVerificationOutcome
     public let source: SourceEvidenceSummary
     public let destinations: [DestinationEvidenceSummary]
     public let verificationPolicyUsed: String?
@@ -164,6 +212,8 @@ public struct SourceEvidenceSummary: Codable, Equatable, Sendable {
     public let executionRoot: String
     public let fileCount: Int
     public let totalBytes: Int64
+    public let stabilityVerifiedFiles: Int
+    public let stabilityFailedFiles: Int
 }
 
 public struct DestinationEvidenceSummary: Codable, Equatable, Sendable {
@@ -173,6 +223,9 @@ public struct DestinationEvidenceSummary: Codable, Equatable, Sendable {
     public let successfulFiles: Int
     public let failedFiles: Int
     public let verifiedBytes: Int64
+    public let verificationOutcome: WorkerVerificationOutcome
+    public let strongFiles: Int
+    public let degradedFiles: Int
 }
 
 public struct DetailEvidenceReference: Codable, Equatable, Sendable {
@@ -204,6 +257,15 @@ struct FileEvidenceRecord: Codable, Equatable, Sendable {
     let checksumAlgorithm: String?
     let sourceChecksum: String?
     let destinationChecksum: String?
+    let verificationOutcome: WorkerVerificationOutcome
+    let sourceStableDuringReads: Bool
+    let prePublicationChecksumMatched: Bool
+    let fullDestinationReadbackPerformed: Bool
+    let destinationReadbackBytes: Int64
+    let cacheBypass: WorkerOperationFact
+    let durabilityFlush: WorkerOperationFact
+    let directoryMetadataFlush: WorkerOperationFact
+    let publication: WorkerPublicationDisposition
     let error: WorkerTypedError?
 }
 
