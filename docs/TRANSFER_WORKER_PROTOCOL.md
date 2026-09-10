@@ -41,14 +41,17 @@ preferences are not protocol inputs.
 
 ## Capability discovery
 
-`capabilities --json` is deterministic for a worker build. V1 advertises:
+`capabilities --json` is deterministic for a worker build. V2 advertises:
 
-- protocol version `1`;
+- protocol version `2`;
 - verification policy `sha256` and algorithm `SHA-256`;
 - at most 16 destinations;
 - atomic no-overwrite publication for copied files;
 - bounded detailed evidence;
 - the source-read-only guarantee;
+- pre-publication SHA-256 verification of worker-owned temporary files;
+- Darwin `F_FULLFSYNC` and directory-publication flush facts;
+- independent full destination readback with a Darwin `F_NOCACHE` request;
 - no pause/resume support yet;
 - worker semantic version/build and exact upstream repository/revision.
 
@@ -56,14 +59,14 @@ A required capability absent from the advertised `capabilities` list rejects
 the job before any destination write. Unknown optional capabilities are retained
 as caller requests but do not weaken execution.
 
-## TransferJobSpec V1
+## TransferJobSpec V2
 
 Dates use ISO-8601. IDs are UUIDs. Paths are absolute machine-local execution
 inputs and are never durable asset identities.
 
 ```json
 {
-  "protocolVersion": 1,
+  "protocolVersion": 2,
   "jobID": "11111111-1111-1111-1111-111111111111",
   "attemptID": "22222222-2222-2222-2222-222222222222",
   "requestedAt": "2026-09-10T12:00:00Z",
@@ -87,11 +90,11 @@ inputs and are never durable asset identities.
 }
 ```
 
-`verificationPolicy` defaults to `sha256` when omitted. V1 supports no
+`verificationPolicy` defaults to `sha256` when omitted. V2 supports no
 non-checksum mode. An unknown policy fails closed; `UserDefaults` and old GUI
 preferences cannot select Quick mode or disable the worker's requested policy.
 
-Before destination writes, V1 rejects malformed/unsupported versions, unknown
+Before destination writes, V2 rejects malformed/unsupported versions, unknown
 mandatory capabilities, empty or missing sources, zero or more than 16
 destinations, duplicate request IDs, non-existing roots, duplicate/nested
 destinations, source/destination containment in either direction, unsafe
@@ -118,42 +121,112 @@ device qualification.
 
 Each `executionRoot` is an existing directory explicitly delegated for this
 attempt. BitMatch pins destination directories with descriptor-relative,
-no-follow operations, writes temporary files, and publishes without overwriting
-an item that already exists. Matching existing files can be reused only after
-checksum verification. A conflicting non-identical file is preserved and
-reported as a failure.
+no-follow operations. A new file follows this bounded sequence:
 
-V1 processes destinations through the existing BitMatch multi-destination path.
+```text
+exclusive worker-owned temporary file
+  -> write from a read-only opened source descriptor
+  -> preserve the source modification time on the temporary file
+  -> ordinary synchronize/fsync
+  -> SHA-256-check the temporary bytes before publication
+  -> recheck opened-source stability
+  -> request Darwin F_FULLFSYNC for the final data + preserved-mtime state
+  -> atomic linkat no-overwrite publication
+  -> remove only the worker-owned temporary name
+  -> fsync the containing destination directory
+  -> independently reopen final file and perform full readback
+```
+
+A pre-existing destination is never replaced. A matching regular file may be
+reused only after checksum verification, but is reported as degraded because
+this attempt did not perform its original write, flush, or publication. A
+conflicting item is preserved and reported as a failure. Cleanup applies only
+to names created by this attempt with the `.bitmatch.tmp.` prefix.
+
+V2 processes destinations through the existing BitMatch multi-destination path.
 It does not claim PP-017's one-source-read fan-out or physical-device topology.
 
-## TransferEvidence V1
+## TransferEvidence V2
 
 The final JSON contains:
 
 - protocol, job, and attempt identity;
 - worker semantic version/build and exact upstream provenance;
 - start/end timestamps and a typed terminal status;
+- an explicit `VERIFIED_STRONG`, `VERIFIED_DEGRADED`, or `FAILED` verification
+  outcome, separate from process completion;
 - source file/byte summary;
 - separate summaries keyed by stable destination request ID;
 - the verification policy actually used;
-- warnings, typed errors, and capabilities used;
+- warnings, deterministic typed errors, and capabilities used;
 - a reference to detailed newline-delimited JSON evidence.
 
 Detailed file results are streamed to `<evidence>.details.jsonl`, not accumulated
 in the final JSON object. The final reference records its format, record count,
-and SHA-256 digest. Successful records include source/destination SHA-256 values.
+and SHA-256 digest. Every record exposes the source and destination SHA-256
+digests when available, attempt-wide/read-time source stability facts,
+pre-publication checksum result, publication disposition, complete-readback
+byte count, and separate outcomes for `F_FULLFSYNC`, directory `fsync`, and
+`F_NOCACHE`.
 
 Both detailed and final artifacts are written under unique `.partial-*` names
 and atomically renamed only when complete. Existing final artifacts are never
 overwritten. A crash can leave a partial artifact, but a missing final evidence
-file can never be interpreted as terminal success. PP-016 will address stronger
-filesystem durability and cold readback guarantees.
+file can never be interpreted as terminal success.
+
+V1 job specs are rejected explicitly as unsupported by the V2 worker. This is
+intentional: a V1 caller does not understand the new degraded result and must
+not silently interpret ordinary checksum success as a strong verification.
+
+## Verification outcome derivation
+
+The worker reports facts; Post Prep remains responsible for deciding whether
+those facts satisfy a future Safe-to-clear policy.
+
+Before deriving any successful outcome, the worker constructs the exact
+expected pair set from the frozen source manifest crossed with every requested
+destination ID. The returned operation results must contain exactly one row for
+each expected pair, with no missing, duplicate, unexpected-source, or
+unexpected-destination row. Per-destination successful/failed counts are
+derived over the frozen manifest, and every fully successful destination's
+verified byte count must equal the frozen source byte total. Structural
+discrepancies emit deterministic `result-set-incomplete`,
+`result-set-duplicate`, `result-set-unexpected`, or
+`result-set-inconsistent` errors and force `FAILED` before strong/degraded
+aggregation.
+
+`VERIFIED_STRONG` requires every planned file/destination pair to have all of
+the following facts: stable source observations, ordinary flush success,
+successful `F_FULLFSYNC`, matching temporary SHA-256 before publication,
+successful no-overwrite publication, successful containing-directory `fsync`,
+a successful `F_NOCACHE` request on an independently reopened final file, a
+complete read of the expected byte count, and matching source/destination
+SHA-256 digests.
+
+`VERIFIED_DEGRADED` means all bytes completed full SHA-256 readback and matched,
+but a stronger capability was explicitly unsupported or the destination was a
+verified pre-existing file. `FAILED` means a required operation failed, facts
+are missing, source stability failed, or any checksum/read length differs.
+Unsupported is never encoded as strong success. Missing facts or an inexact
+result set can produce neither `VERIFIED_STRONG` nor `VERIFIED_DEGRADED`.
+
+## Guarantee table
+
+| Evidence step | What it proves | What it does not prove |
+| --- | --- | --- |
+| Copy completion | The write loop reached EOF and the temporary file had the expected length. | That bytes match, are durable, or were published. |
+| Exact result-set validation | There is exactly one terminal result for every frozen source-relative-path × requested-destination-ID pair; destination counts and successful byte totals reconcile to that plan. | Byte correctness, durability, or storage independence without the other evidence steps. |
+| SHA-256 destination match | The bytes read for source and destination produced the same SHA-256 digest; PP-016 also checks the temporary file before publication. | Physical media residence, future readability, or device independence. |
+| Ordinary synchronize/fsync | The OS accepted its normal file-data synchronization request. | That a device with volatile caches committed bytes to NAND/platter. |
+| Darwin `F_FULLFSYNC` success | After data writing, mtime preservation, temporary SHA-256, and source-stability checks, macOS accepted the stronger full-sync request for that pre-publication inode state. | Absolute physical persistence; later publication metadata and bridges, filesystems, firmware, and hardware remain separately bounded. |
+| Atomic no-overwrite publication + directory fsync | The final name was created without replacing an existing item and the OS accepted synchronization of its containing directory metadata. | That all higher/lower storage layers are power-loss proof. |
+| Full `F_NOCACHE`-requested readback | An independently reopened final descriptor returned the complete expected byte count and matching SHA-256 while the OS-cache-bypass request was active. | A guaranteed physical reread from flash/platter; `F_NOCACHE` is an OS-cache-bypass request only. |
 
 ## Exit and terminal states
 
 | Exit | Evidence terminal status | Meaning |
 | ---: | --- | --- |
-| `0` | `succeeded` | Every planned file/destination verified. |
+| `0` | `succeeded` | Every planned file/destination verified; inspect `verificationOutcome` to distinguish strong from degraded. |
 | `2` | `completedWithFailures` | Execution completed with one or more file/destination failures. |
 | `3` | `invalidJob` | Decode/preflight/topology/input rejection. Malformed JSON may have no final evidence because job/attempt identity is unavailable. |
 | `4` | `unsupportedProtocolOrCapability` | Unsupported protocol, verification policy, mandatory capability, or destination count. |
@@ -166,7 +239,6 @@ unknown-success reconciliation after a process crash.
 
 ## Explicitly deferred work
 
-- PP-016: full-fsync/durability and cache-bypassed cold readback hardening.
 - PP-017: one-source-read N-destination fan-out and physical topology policy.
 - PP-018: Post Prep process launch, SQLite/project-state integration, bounded
   orchestration, reconciliation, and evidence acceptance.

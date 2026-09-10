@@ -127,6 +127,43 @@ protocol FileSystemService {
 - **IOSFileSystemService**: Handles iOS security-scoped resources and document picker
 - **MacOSFileSystemService**: Handles macOS file dialogs and direct file system access
 
+### Headless worker durability boundary
+
+The macOS transfer worker injects a small Darwin durability/readback adapter
+into the same `SharedFileOperationsService -> FileCopyService` path used by the
+apps. It is not a second transfer engine. App calls leave the adapter absent;
+worker calls use it to record the exact result of `F_FULLFSYNC`, directory
+`fsync`, and `F_NOCACHE` requests and to make the final SHA-256 destination
+digest from an independently reopened, complete readback.
+
+New worker files are held under exclusive temporary names. The worker writes
+the data, preserves the source mtime, performs ordinary synchronization,
+SHA-256-checks the temporary bytes, rechecks source stability, and then requests
+`F_FULLFSYNC` for that final pre-publication inode state before an atomic
+`linkat` no-overwrite publication. It then
+removes only its temporary name, synchronizes the containing directory, and
+reopens the final file for the full `F_NOCACHE`-requested readback. Source files
+are opened read-only with `O_NOFOLLOW`; descriptor snapshots and an attempt-wide
+manifest comparison detect changes around copy and verification.
+
+| Layer | Positive fact | Limit of the fact |
+| --- | --- | --- |
+| Write loop | Expected byte count reached a worker-owned temporary file. | No integrity or durability claim by itself. |
+| Exact result set | Every frozen source-relative-path × requested-destination-ID pair has exactly one terminal result, with no missing, duplicate, or unexpected row; destination counts and complete-success bytes reconcile to the frozen manifest. | Does not prove the bytes or their durability without the remaining evidence. |
+| SHA-256 | Temporary bytes before publication and final readback bytes match the source digest. | Collision resistance is not physical-media proof or future readability. |
+| `synchronize` / fsync | The OS accepted normal file synchronization. | Volatile device caches may still exist. |
+| Darwin `F_FULLFSYNC` | macOS accepted its stronger full-sync request after data and preserved-mtime mutations on the pre-publication inode. | Does not prove physical residence on NAND/platter across every bridge, filesystem, firmware, or device; publication metadata is covered separately. |
+| `linkat` no-overwrite + directory fsync | Publication did not replace a pre-existing name and the OS accepted containing-directory synchronization. | Does not make the complete storage stack power-loss proof. |
+| Full `F_NOCACHE`-requested readback | A fresh final descriptor returned every expected byte and the digest matched while cache bypass was requested. | `F_NOCACHE` does not prove bytes were physically reread from flash/platter. |
+
+Evidence aggregates these facts as `VERIFIED_STRONG`, `VERIFIED_DEGRADED`, or
+`FAILED`. Strong requires every strong fact for every planned file. Both strong
+and degraded outcomes require an exact frozen-manifest × destination result set.
+Unsupported stronger syscalls can yield degraded evidence only after complete
+matching readback; a missing, duplicate, or unexpected result, syscall failure,
+short read, mutation, collision, or checksum mismatch fails. This classification
+is worker evidence, not Safe-to-clear policy.
+
 ## Data Models
 
 ### Core Models (`Shared/Core/Models/`)
