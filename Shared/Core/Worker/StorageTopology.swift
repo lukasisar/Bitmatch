@@ -152,7 +152,10 @@ struct MacOSStorageTopologyResolver: StorageTopologyResolving {
                           !isAmbiguous(wholeInfo) else {
                         return .unknown(basis: "diskutil-info-plist", detail: "APFS whole-disk backing is ambiguous")
                     }
-                    leaves.append(physicalIdentifier(wholeInfo, fallback: wholeDisk))
+                    guard let identifier = physicalIdentifier(wholeInfo, wholeDisk: wholeDisk) else {
+                        return .unknown(basis: "diskutil-info-plist", detail: "Physical whole disk has no I/O Registry identity")
+                    }
+                    leaves.append(identifier)
                 } catch {
                     return .unknown(basis: "diskutil-info-plist", detail: error.localizedDescription)
                 }
@@ -177,9 +180,12 @@ struct MacOSStorageTopologyResolver: StorageTopologyResolving {
                   !isAmbiguous(wholeInfo) else {
                 return .unknown(basis: "diskutil-info-plist", detail: "Whole-disk parent is virtual or composite")
             }
+            guard let identifier = physicalIdentifier(wholeInfo, wholeDisk: wholeDisk) else {
+                return .unknown(basis: "diskutil-info-plist", detail: "Physical whole disk has no I/O Registry identity")
+            }
             return StorageIdentityEvidence(
                 resolutionStatus: .resolved,
-                physicalLeafIdentifiers: [physicalIdentifier(wholeInfo, fallback: wholeDisk)],
+                physicalLeafIdentifiers: [identifier],
                 basis: "diskutil-parent-whole-disk"
             )
         } catch {
@@ -195,11 +201,11 @@ struct MacOSStorageTopologyResolver: StorageTopologyResolving {
         return false
     }
 
-    private func physicalIdentifier(_ info: [String: Any], fallback: String) -> String {
+    private func physicalIdentifier(_ info: [String: Any], wholeDisk: String) -> String? {
         if let registryPath = info["DeviceTreePath"] as? String, !registryPath.isEmpty {
-            return "ioregistry:" + registryPath
+            return "bsd-whole-disk:\(wholeDisk)|ioregistry:" + registryPath
         }
-        return "bsd-whole-disk:" + fallback
+        return nil
     }
 
     private func diskInfo(_ target: String) throws -> [String: Any] {
@@ -211,12 +217,13 @@ struct MacOSStorageTopologyResolver: StorageTopologyResolving {
         process.standardOutput = output
         process.standardError = errors
         try process.run()
-        process.waitUntilExit()
         let data = output.fileHandleForReading.readDataToEndOfFile()
+        let errorData = errors.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
         guard process.terminationStatus == 0,
               let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any],
               plist["Error"] as? Bool != true else {
-            let message = String(data: errors.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8)
+            let message = String(data: errorData, encoding: .utf8)
                 ?? "diskutil could not resolve storage"
             throw NSError(domain: "BitMatchTransferWorker.Topology", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: message])
         }

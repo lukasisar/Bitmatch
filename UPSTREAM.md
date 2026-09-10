@@ -28,6 +28,13 @@ versioned job/evidence contract while reusing BitMatch's existing
 from `SharedModels.swift`, makes verification scheduling explicit for headless
 callers, and adds deterministic worker fixtures and tests.
 
+PP-016 strengthens that worker with durable publication/readback evidence and
+exact manifest × destination result accounting. PP-017 builds on merged commit
+`f0210efdde188912625376ece0179b5e6b3d5a7f`: every source file now has one bounded
+transfer-byte pass fanned out to all requested destinations, and protocol V3
+reports conservative macOS physical-leaf topology separately from integrity and
+durability outcomes. These changes do not move the recorded upstream fork point.
+
 Future updates must record any new upstream base or cherry-picked upstream
 revision here. The PP-015 pull request is intentionally review-only and must not
 be merged as part of this issue.

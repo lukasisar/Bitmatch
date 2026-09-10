@@ -981,14 +981,36 @@ class SharedFileOperationsService: FileOperationsService {
             try await waitIfPaused()
             guard !targets.isEmpty else { break }
 
-            let copied = try await FileCopyService.copyFileFanOut(
-                from: entry.url,
-                relativePath: entry.relativePath,
-                to: targets,
-                durabilityIO: durabilityIO,
-                durabilityRecorder: durabilityRecorder,
-                pauseCheck: { try await self.waitIfPaused() }
-            )
+            let copied: FanOutFileCopyResult
+            do {
+                copied = try await FileCopyService.copyFileFanOut(
+                    from: entry.url,
+                    relativePath: entry.relativePath,
+                    to: targets,
+                    durabilityIO: durabilityIO,
+                    durabilityRecorder: durabilityRecorder,
+                    pauseCheck: { try await self.waitIfPaused() }
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                for target in targets {
+                    let failure = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: target.root.destinationURL(for: entry.relativePath),
+                        success: false,
+                        error: error,
+                        fileSize: 0,
+                        verificationResult: nil,
+                        processingTime: 0
+                    )
+                    _ = await progressState.recordCopyError()
+                    await destinationProgress.increment(destIndex: target.index)
+                    await resultStore.upsert(failure)
+                    await onFileResult?(failure)
+                }
+                continue
+            }
 
             for target in targets {
                 guard let destinationCopy = copied.destinations.first(where: {

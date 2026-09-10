@@ -19,7 +19,7 @@ The worker reuses the same BitMatch safety path used by the app:
 ```text
 TransferWorkerRuntime
   -> SharedFileOperationsService
-  -> SafetyValidator + FileCopyService + SharedChecksumService
+  -> SafetyValidator + FileCopyService fan-out + macOS topology resolver
 ```
 
 It does not contain a simplified second copy implementation. The Swift package
@@ -41,9 +41,9 @@ preferences are not protocol inputs.
 
 ## Capability discovery
 
-`capabilities --json` is deterministic for a worker build. V2 advertises:
+`capabilities --json` is deterministic for a worker build. V3 advertises:
 
-- protocol version `2`;
+- protocol version `3`;
 - verification policy `sha256` and algorithm `SHA-256`;
 - at most 16 destinations;
 - atomic no-overwrite publication for copied files;
@@ -52,6 +52,9 @@ preferences are not protocol inputs.
 - pre-publication SHA-256 verification of worker-owned temporary files;
 - Darwin `F_FULLFSYNC` and directory-publication flush facts;
 - independent full destination readback with a Darwin `F_NOCACHE` request;
+- one-source-read multi-destination fan-out;
+- synchronous backpressure with at most one 4 MiB source chunk buffered;
+- macOS physical-storage topology facts;
 - no pause/resume support yet;
 - worker semantic version/build and exact upstream repository/revision.
 
@@ -59,14 +62,14 @@ A required capability absent from the advertised `capabilities` list rejects
 the job before any destination write. Unknown optional capabilities are retained
 as caller requests but do not weaken execution.
 
-## TransferJobSpec V2
+## TransferJobSpec V3
 
 Dates use ISO-8601. IDs are UUIDs. Paths are absolute machine-local execution
 inputs and are never durable asset identities.
 
 ```json
 {
-  "protocolVersion": 2,
+  "protocolVersion": 3,
   "jobID": "11111111-1111-1111-1111-111111111111",
   "attemptID": "22222222-2222-2222-2222-222222222222",
   "requestedAt": "2026-09-10T12:00:00Z",
@@ -90,11 +93,11 @@ inputs and are never durable asset identities.
 }
 ```
 
-`verificationPolicy` defaults to `sha256` when omitted. V2 supports no
+`verificationPolicy` defaults to `sha256` when omitted. V3 supports no
 non-checksum mode. An unknown policy fails closed; `UserDefaults` and old GUI
 preferences cannot select Quick mode or disable the worker's requested policy.
 
-Before destination writes, V2 rejects malformed/unsupported versions, unknown
+Before destination writes, V3 rejects malformed/unsupported versions, unknown
 mandatory capabilities, empty or missing sources, zero or more than 16
 destinations, duplicate request IDs, non-existing roots, duplicate/nested
 destinations, source/destination containment in either direction, unsafe
@@ -102,8 +105,8 @@ symlinks/traversal, protected destinations, and insufficient storage. Evidence
 paths must be absolute, must have an existing parent, must not be inside the
 source tree, and must not already exist.
 
-Destination roles are `working`, `backup`, and `optional`. PP-015 records roles
-but does not interpret them as a clearing policy.
+Destination roles are `working`, `backup`, and `optional`. A role expresses
+business intent only. It neither establishes nor implies physical independence.
 
 ## Source-read-only invariant
 
@@ -125,7 +128,7 @@ no-follow operations. A new file follows this bounded sequence:
 
 ```text
 exclusive worker-owned temporary file
-  -> write from a read-only opened source descriptor
+  -> receive chunks from one read-only opened source descriptor
   -> preserve the source modification time on the temporary file
   -> ordinary synchronize/fsync
   -> SHA-256-check the temporary bytes before publication
@@ -143,10 +146,52 @@ this attempt did not perform its original write, flush, or publication. A
 conflicting item is preserved and reported as a failure. Cleanup applies only
 to names created by this attempt with the `.bitmatch.tmp.` prefix.
 
-V2 processes destinations through the existing BitMatch multi-destination path.
-It does not claim PP-017's one-source-read fan-out or physical-device topology.
+For each manifest file, V3 opens the source once, freezes its descriptor identity,
+and makes one sequential transfer pass. Each source chunk updates one SHA-256
+state and is then written to every active destination temporary file. The worker
+does not read the next source chunk until all active writers have accepted the
+current one. This synchronous producer/consumer design is the backpressure
+mechanism: it retains at most one 4 MiB source chunk regardless of destination
+count or file size. A slow destination therefore slows the producer instead of
+growing a queue.
 
-## TransferEvidence V2
+A destination writer that fails is removed from the active set, its worker-owned
+temporary file is cleaned, and its result remains failed in the exact Cartesian
+result set. Other writers continue receiving the same source stream and can
+independently complete. One successful destination never changes the requested
+operation as a whole into success when another destination failed.
+
+After EOF, the source digest from that single transfer pass is the reference for
+every destination. Each published destination is independently reopened, given
+an `F_NOCACHE` request, read completely, hashed, and compared with that reference.
+There is no destination-count-multiplied source verification read. Metadata-only
+read-only source descriptor checks before readback and the attempt-wide frozen
+manifest comparison preserve source-stability protection without consuming the
+source byte stream again.
+
+## Physical-storage topology
+
+V3 resolves topology behind the injectable `StorageTopologyResolving` seam.
+Tests use deterministic synthetic identities; CI does not need two SSDs.
+Production uses macOS `/usr/sbin/diskutil info -plist` facts for the mounted
+volume, follows `APFSPhysicalStores` to each backing store and then its
+`ParentWholeDisk`, and records the whole device's I/O Registry device-tree path
+qualified by its current BSD whole-disk identifier. If the I/O Registry identity
+is unavailable, topology stays unknown. Volume names, mount
+paths, folders, partition identifiers, and volume UUIDs are never treated as
+proof of independence.
+
+Only a single confidently resolved physical leaf can participate in a
+`samePhysicalDevice` or `differentPhysicalDevices` relationship. Network
+filesystems, disk images, virtual media, RAID, multi-store APFS/Fusion or other
+composite devices, missing system facts, and ambiguous bridges resolve to
+`unknown`. Unknown is evidence of unresolved topology, not independence.
+
+Topology is reported as facts for the caller. It does not alter destination
+`VERIFIED_STRONG`/`VERIFIED_DEGRADED` integrity and durability classification,
+and the worker does not implement PP-018's Safe-to-clear rule.
+
+## TransferEvidence V3
 
 The final JSON contains:
 
@@ -155,8 +200,11 @@ The final JSON contains:
 - start/end timestamps and a typed terminal status;
 - an explicit `VERIFIED_STRONG`, `VERIFIED_DEGRADED`, or `FAILED` verification
   outcome, separate from process completion;
-- source file/byte summary;
+- source file/byte summary, transfer-read-pass count, bytes read, and observed
+  maximum chunk size;
 - separate summaries keyed by stable destination request ID;
+- source/destination storage identities and pairwise destination physical-device
+  relationships (`samePhysicalDevice`, `differentPhysicalDevices`, or `unknown`);
 - the verification policy actually used;
 - warnings, deterministic typed errors, and capabilities used;
 - a reference to detailed newline-delimited JSON evidence.
@@ -174,9 +222,9 @@ and atomically renamed only when complete. Existing final artifacts are never
 overwritten. A crash can leave a partial artifact, but a missing final evidence
 file can never be interpreted as terminal success.
 
-V1 job specs are rejected explicitly as unsupported by the V2 worker. This is
-intentional: a V1 caller does not understand the new degraded result and must
-not silently interpret ordinary checksum success as a strong verification.
+V1 and V2 job specs are rejected explicitly as unsupported by the V3 worker.
+This deliberate protocol bump prevents a V2 caller from silently ignoring the
+new source-read and storage-topology evidence required by PP-017.
 
 ## Verification outcome derivation
 
@@ -195,6 +243,11 @@ discrepancies emit deterministic `result-set-incomplete`,
 `result-set-inconsistent` errors and force `FAILED` before strong/degraded
 aggregation.
 
+The worker also requires exactly one recorded transfer-byte pass per frozen
+source file, total transfer bytes equal to the frozen manifest byte total, and
+no observed chunk larger than 4 MiB. Missing or inconsistent source-read facts
+emit `source-read-incomplete` and force `FAILED`.
+
 `VERIFIED_STRONG` requires every planned file/destination pair to have all of
 the following facts: stable source observations, ordinary flush success,
 successful `F_FULLFSYNC`, matching temporary SHA-256 before publication,
@@ -209,6 +262,8 @@ verified pre-existing file. `FAILED` means a required operation failed, facts
 are missing, source stability failed, or any checksum/read length differs.
 Unsupported is never encoded as strong success. Missing facts or an inexact
 result set can produce neither `VERIFIED_STRONG` nor `VERIFIED_DEGRADED`.
+These outcomes classify destination integrity/durability evidence only. Two
+strong destinations can still have `samePhysicalDevice` or `unknown` topology.
 
 ## Guarantee table
 
@@ -216,11 +271,13 @@ result set can produce neither `VERIFIED_STRONG` nor `VERIFIED_DEGRADED`.
 | --- | --- | --- |
 | Copy completion | The write loop reached EOF and the temporary file had the expected length. | That bytes match, are durable, or were published. |
 | Exact result-set validation | There is exactly one terminal result for every frozen source-relative-path × requested-destination-ID pair; destination counts and successful byte totals reconcile to that plan. | Byte correctness, durability, or storage independence without the other evidence steps. |
-| SHA-256 destination match | The bytes read for source and destination produced the same SHA-256 digest; PP-016 also checks the temporary file before publication. | Physical media residence, future readability, or device independence. |
+| Single transfer source SHA-256 | Each source file's transfer bytes were read once and produced the reference digest used by all destinations. | Destination correctness or physical independence without destination readback/topology evidence. |
+| SHA-256 destination match | The independently reopened destination produced the same SHA-256 digest as the one-pass transfer source digest; the temporary file was also checked before publication. | Physical media residence, future readability, or device independence. |
 | Ordinary synchronize/fsync | The OS accepted its normal file-data synchronization request. | That a device with volatile caches committed bytes to NAND/platter. |
 | Darwin `F_FULLFSYNC` success | After data writing, mtime preservation, temporary SHA-256, and source-stability checks, macOS accepted the stronger full-sync request for that pre-publication inode state. | Absolute physical persistence; later publication metadata and bridges, filesystems, firmware, and hardware remain separately bounded. |
 | Atomic no-overwrite publication + directory fsync | The final name was created without replacing an existing item and the OS accepted synchronization of its containing directory metadata. | That all higher/lower storage layers are power-loss proof. |
 | Full `F_NOCACHE`-requested readback | An independently reopened final descriptor returned the complete expected byte count and matching SHA-256 while the OS-cache-bypass request was active. | A guaranteed physical reread from flash/platter; `F_NOCACHE` is an OS-cache-bypass request only. |
+| Physical-leaf relationship | macOS storage facts resolved two destinations to the same or different single underlying physical leaf. | Integrity, durability, Safe-to-clear, or independence when the result is `unknown`. |
 
 ## Exit and terminal states
 
@@ -234,17 +291,16 @@ result set can produce neither `VERIFIED_STRONG` nor `VERIFIED_DEGRADED`.
 | `70` | `internalFailure` | Unexpected worker or evidence-publication failure. |
 
 The caller must require both the expected process result and a complete,
-decodable evidence artifact matching its job and attempt. PP-015 does not solve
+decodable evidence artifact matching its job and attempt. PP-017 does not solve
 unknown-success reconciliation after a process crash.
 
 ## Explicitly deferred work
 
-- PP-017: one-source-read N-destination fan-out and physical topology policy.
 - PP-018: Post Prep process launch, SQLite/project-state integration, bounded
   orchestration, reconciliation, and evidence acceptance.
 - PP-019: production qualification on physical cards, readers, hubs, and drives.
 
-There is **no Safe-to-clear authority in PP-015**. Neither worker success nor its
+There is **no Safe-to-clear authority in PP-017**. Neither worker success nor its
 fixture tests authorize erasing or formatting source media.
 
 ## Provenance
