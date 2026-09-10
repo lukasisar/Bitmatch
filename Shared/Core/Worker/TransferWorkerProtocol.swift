@@ -1,11 +1,11 @@
 import Foundation
 
 public enum TransferWorkerIdentity {
-    public static let semanticVersion = "0.2.0"
-    public static let build = "pp-016.1"
+    public static let semanticVersion = "0.3.0"
+    public static let build = "pp-017.0"
     public static let upstreamRepository = "https://github.com/mikecerisano/Bitmatch"
     public static let upstreamRevision = "3debabe2e1049c7e02ee5f3587464894f3b190d5"
-    public static let protocolVersion = 2
+    public static let protocolVersion = 3
 }
 
 public struct TransferWorkerCapabilities: Codable, Equatable, Sendable {
@@ -202,6 +202,7 @@ public struct TransferEvidence: Codable, Equatable, Sendable {
     public let verificationOutcome: WorkerVerificationOutcome
     public let source: SourceEvidenceSummary
     public let destinations: [DestinationEvidenceSummary]
+    public let storageTopology: StorageTopologyEvidence
     public let verificationPolicyUsed: String?
     public let detailEvidence: DetailEvidenceReference?
     public let warnings: [String]
@@ -222,6 +223,7 @@ public struct TransferEvidence: Codable, Equatable, Sendable {
         verificationOutcome: WorkerVerificationOutcome,
         source: SourceEvidenceSummary,
         destinations: [DestinationEvidenceSummary],
+        storageTopology: StorageTopologyEvidence,
         verificationPolicyUsed: String?,
         detailEvidence: DetailEvidenceReference?,
         warnings: [String],
@@ -241,6 +243,7 @@ public struct TransferEvidence: Codable, Equatable, Sendable {
         self.verificationOutcome = verificationOutcome
         self.source = source
         self.destinations = destinations
+        self.storageTopology = storageTopology
         self.verificationPolicyUsed = verificationPolicyUsed
         self.detailEvidence = detailEvidence
         self.warnings = warnings
@@ -251,7 +254,7 @@ public struct TransferEvidence: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case protocolVersion, jobID, attemptID, workerVersion, workerBuild
         case upstreamRepository, upstreamRevision, startedAt, endedAt
-        case terminalStatus, verificationOutcome, source, destinations
+        case terminalStatus, verificationOutcome, source, destinations, storageTopology
         case verificationPolicyUsed, detailEvidence, warnings, errors, capabilitiesUsed
     }
 
@@ -278,6 +281,7 @@ public struct TransferEvidence: Codable, Equatable, Sendable {
         verificationOutcome = try container.decode(WorkerVerificationOutcome.self, forKey: .verificationOutcome)
         source = try container.decode(SourceEvidenceSummary.self, forKey: .source)
         destinations = try container.decode([DestinationEvidenceSummary].self, forKey: .destinations)
+        storageTopology = try container.decode(StorageTopologyEvidence.self, forKey: .storageTopology)
         verificationPolicyUsed = try container.decodeIfPresent(String.self, forKey: .verificationPolicyUsed)
         detailEvidence = try container.decodeIfPresent(DetailEvidenceReference.self, forKey: .detailEvidence)
         warnings = try container.decode([String].self, forKey: .warnings)
@@ -290,6 +294,9 @@ public struct SourceEvidenceSummary: Codable, Equatable, Sendable {
     public let executionRoot: String
     public let fileCount: Int
     public let totalBytes: Int64
+    public let transferReadPasses: Int
+    public let transferBytesRead: Int64
+    public let maximumBufferedBytes: Int
     public let stabilityVerifiedFiles: Int
     public let stabilityFailedFiles: Int
 }

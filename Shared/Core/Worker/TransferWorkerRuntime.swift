@@ -106,6 +106,7 @@ private final class WorkerDurabilityFactsCollector: TransferDurabilityRecorder, 
 
     private let lock = NSLock()
     private var facts: [String: Snapshot] = [:]
+    private var sourceReads: [String: TransferSourceReadFacts] = [:]
 
     func recordCopyFacts(_ copyFacts: TransferCopyDurabilityFacts, destinationPath: String) {
         lock.lock()
@@ -129,6 +130,18 @@ private final class WorkerDurabilityFactsCollector: TransferDurabilityRecorder, 
         lock.lock()
         defer { lock.unlock() }
         return facts[destinationPath] ?? Snapshot()
+    }
+
+    func recordSourceReadFacts(_ sourceReadFacts: TransferSourceReadFacts, sourcePath: String) {
+        lock.lock()
+        sourceReads[sourcePath] = sourceReadFacts
+        lock.unlock()
+    }
+
+    func allSourceReadFacts() -> [TransferSourceReadFacts] {
+        lock.lock()
+        defer { lock.unlock() }
+        return Array(sourceReads.values)
     }
 }
 
@@ -300,19 +313,28 @@ public struct TransferWorkerRuntime {
         "directory-publication-flush",
         "exact-result-set-validation",
         "full-destination-readback",
+        "macos-physical-storage-topology-facts",
         "os-cache-bypass-request",
         "sha256-verification",
+        "single-source-read-fanout",
+        "synchronous-bounded-backpressure-4194304-bytes",
         "source-read-only",
     ]
 
     private let durabilityIO: any TransferDurabilityIO
+    private let topologyResolver: any StorageTopologyResolving
 
     public init() {
         self.durabilityIO = DarwinTransferDurabilityIO()
+        self.topologyResolver = MacOSStorageTopologyResolver()
     }
 
-    init(durabilityIO: any TransferDurabilityIO) {
+    init(
+        durabilityIO: any TransferDurabilityIO,
+        topologyResolver: any StorageTopologyResolving = MacOSStorageTopologyResolver()
+    ) {
         self.durabilityIO = durabilityIO
+        self.topologyResolver = topologyResolver
     }
 
     public func capabilities() -> TransferWorkerCapabilities {
@@ -339,6 +361,9 @@ public struct TransferWorkerRuntime {
             executionRoot: sourceURL.path,
             fileCount: 0,
             totalBytes: 0,
+            transferReadPasses: 0,
+            transferBytesRead: 0,
+            maximumBufferedBytes: 0,
             stabilityVerifiedFiles: 0,
             stabilityFailedFiles: 0
         )
@@ -369,6 +394,9 @@ public struct TransferWorkerRuntime {
                 executionRoot: sourceURL.path,
                 fileCount: manifest.count,
                 totalBytes: totalBytes,
+                transferReadPasses: 0,
+                transferBytesRead: 0,
+                maximumBufferedBytes: 0,
                 stabilityVerifiedFiles: 0,
                 stabilityFailedFiles: 0
             )
@@ -398,7 +426,8 @@ public struct TransferWorkerRuntime {
                 checksum: SharedChecksumService.shared,
                 pipelineVerification: true,
                 durabilityIO: durabilityIO,
-                durabilityRecorder: durabilityFacts
+                durabilityRecorder: durabilityFacts,
+                singleSourceReadFanOut: true
             )
 
             do {
@@ -433,7 +462,12 @@ public struct TransferWorkerRuntime {
                         userInfo: [NSLocalizedDescriptionKey: callbackFailure]
                     )
                 }
-                let sourceStableAcrossAttempt = sourceManifestRemainedStable(
+                let sourceReadFacts = durabilityFacts.allSourceReadFacts()
+                let transferReadEvidenceComplete = sourceReadFacts.count == manifest.count
+                    && sourceReadFacts.allSatisfy { $0.readPasses == 1 }
+                    && sourceReadFacts.reduce(Int64(0)) { $0 + $1.bytesRead } == totalBytes
+                    && sourceReadFacts.allSatisfy { $0.maximumBufferedBytes <= FileCopyService.fanOutMaximumBufferedBytes }
+                let sourceStableAcrossAttempt = transferReadEvidenceComplete && sourceManifestRemainedStable(
                     sourceAttemptSnapshot,
                     sourceURL: sourceURL
                 )
@@ -476,7 +510,12 @@ public struct TransferWorkerRuntime {
                 var errors = makeErrors(operation: operation, job: job, sourceURL: sourceURL)
                 errors.append(contentsOf: resultSetValidation.errors)
                 if !sourceStableAcrossAttempt {
-                    errors.append(WorkerTypedError(code: "source-mutated", message: "Source manifest changed during the transfer attempt"))
+                    errors.append(WorkerTypedError(
+                        code: transferReadEvidenceComplete ? "source-mutated" : "source-read-incomplete",
+                        message: transferReadEvidenceComplete
+                            ? "Source manifest changed during the transfer attempt"
+                            : "Single-pass source-read evidence was incomplete or exceeded the advertised bound"
+                    ))
                 }
                 let detailReference = try await writer.publish()
                 let outcome = resultSetValidation.verificationOutcome(
@@ -701,6 +740,11 @@ public struct TransferWorkerRuntime {
             verificationOutcome: verificationOutcome,
             source: source,
             destinations: destinations,
+            storageTopology: StorageTopologyClassifier.evidence(
+                sourceURL: URL(fileURLWithPath: source.executionRoot, isDirectory: true),
+                destinations: job.destinations,
+                resolver: topologyResolver
+            ),
             verificationPolicyUsed: verificationPolicyUsed,
             detailEvidence: detailReference,
             warnings: warnings,
@@ -775,11 +819,18 @@ public struct TransferWorkerRuntime {
         facts: WorkerDurabilityFactsCollector,
         sourceStableAcrossAttempt: Bool
     ) -> SourceEvidenceSummary {
+        let sourceReads = facts.allSourceReadFacts()
+        let readPasses = sourceReads.reduce(0) { $0 + $1.readPasses }
+        let bytesRead = sourceReads.reduce(Int64(0)) { $0 + $1.bytesRead }
+        let maximumBufferedBytes = sourceReads.map(\.maximumBufferedBytes).max() ?? 0
         guard sourceStableAcrossAttempt else {
             return SourceEvidenceSummary(
                 executionRoot: base.executionRoot,
                 fileCount: base.fileCount,
                 totalBytes: base.totalBytes,
+                transferReadPasses: readPasses,
+                transferBytesRead: bytesRead,
+                maximumBufferedBytes: maximumBufferedBytes,
                 stabilityVerifiedFiles: 0,
                 stabilityFailedFiles: base.fileCount
             )
@@ -800,6 +851,9 @@ public struct TransferWorkerRuntime {
             executionRoot: base.executionRoot,
             fileCount: base.fileCount,
             totalBytes: base.totalBytes,
+            transferReadPasses: readPasses,
+            transferBytesRead: bytesRead,
+            maximumBufferedBytes: maximumBufferedBytes,
             stabilityVerifiedFiles: stable,
             stabilityFailedFiles: max(0, base.fileCount - stable)
         )
