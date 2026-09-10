@@ -126,10 +126,11 @@ no-follow operations. A new file follows this bounded sequence:
 ```text
 exclusive worker-owned temporary file
   -> write from a read-only opened source descriptor
+  -> preserve the source modification time on the temporary file
   -> ordinary synchronize/fsync
-  -> request Darwin F_FULLFSYNC
   -> SHA-256-check the temporary bytes before publication
   -> recheck opened-source stability
+  -> request Darwin F_FULLFSYNC for the final data + preserved-mtime state
   -> atomic linkat no-overwrite publication
   -> remove only the worker-owned temporary name
   -> fsync the containing destination directory
@@ -142,7 +143,7 @@ this attempt did not perform its original write, flush, or publication. A
 conflicting item is preserved and reported as a failure. Cleanup applies only
 to names created by this attempt with the `.bitmatch.tmp.` prefix.
 
-V1 processes destinations through the existing BitMatch multi-destination path.
+V2 processes destinations through the existing BitMatch multi-destination path.
 It does not claim PP-017's one-source-read fan-out or physical-device topology.
 
 ## TransferEvidence V2
@@ -182,6 +183,18 @@ not silently interpret ordinary checksum success as a strong verification.
 The worker reports facts; Post Prep remains responsible for deciding whether
 those facts satisfy a future Safe-to-clear policy.
 
+Before deriving any successful outcome, the worker constructs the exact
+expected pair set from the frozen source manifest crossed with every requested
+destination ID. The returned operation results must contain exactly one row for
+each expected pair, with no missing, duplicate, unexpected-source, or
+unexpected-destination row. Per-destination successful/failed counts are
+derived over the frozen manifest, and every fully successful destination's
+verified byte count must equal the frozen source byte total. Structural
+discrepancies emit deterministic `result-set-incomplete`,
+`result-set-duplicate`, `result-set-unexpected`, or
+`result-set-inconsistent` errors and force `FAILED` before strong/degraded
+aggregation.
+
 `VERIFIED_STRONG` requires every planned file/destination pair to have all of
 the following facts: stable source observations, ordinary flush success,
 successful `F_FULLFSYNC`, matching temporary SHA-256 before publication,
@@ -194,17 +207,18 @@ SHA-256 digests.
 but a stronger capability was explicitly unsupported or the destination was a
 verified pre-existing file. `FAILED` means a required operation failed, facts
 are missing, source stability failed, or any checksum/read length differs.
-Unsupported is never encoded as success, and missing facts can never produce
-`VERIFIED_STRONG`.
+Unsupported is never encoded as strong success. Missing facts or an inexact
+result set can produce neither `VERIFIED_STRONG` nor `VERIFIED_DEGRADED`.
 
 ## Guarantee table
 
 | Evidence step | What it proves | What it does not prove |
 | --- | --- | --- |
 | Copy completion | The write loop reached EOF and the temporary file had the expected length. | That bytes match, are durable, or were published. |
+| Exact result-set validation | There is exactly one terminal result for every frozen source-relative-path × requested-destination-ID pair; destination counts and successful byte totals reconcile to that plan. | Byte correctness, durability, or storage independence without the other evidence steps. |
 | SHA-256 destination match | The bytes read for source and destination produced the same SHA-256 digest; PP-016 also checks the temporary file before publication. | Physical media residence, future readability, or device independence. |
 | Ordinary synchronize/fsync | The OS accepted its normal file-data synchronization request. | That a device with volatile caches committed bytes to NAND/platter. |
-| Darwin `F_FULLFSYNC` success | macOS accepted the stronger full-sync request for the temporary destination file. | Absolute physical persistence; bridges, filesystems, firmware, and hardware can limit the guarantee. |
+| Darwin `F_FULLFSYNC` success | After data writing, mtime preservation, temporary SHA-256, and source-stability checks, macOS accepted the stronger full-sync request for that pre-publication inode state. | Absolute physical persistence; later publication metadata and bridges, filesystems, firmware, and hardware remain separately bounded. |
 | Atomic no-overwrite publication + directory fsync | The final name was created without replacing an existing item and the OS accepted synchronization of its containing directory metadata. | That all higher/lower storage layers are power-loss proof. |
 | Full `F_NOCACHE`-requested readback | An independently reopened final descriptor returned the complete expected byte count and matching SHA-256 while the OS-cache-bypass request was active. | A guaranteed physical reread from flash/platter; `F_NOCACHE` is an OS-cache-bypass request only. |
 
