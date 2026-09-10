@@ -13,6 +13,7 @@ project. This file is the durable record of the fork point and local divergence.
 | Reviewed baseline | `3debabe2e1049c7e02ee5f3587464894f3b190d5` |
 | First divergence commit | `edcfac29f2ed40a19a7c7e1e9b7c63d76c72389b` |
 | Divergence branch | `pp-015-transfer-worker-boundary` |
+| PP-015 review pull request | `https://github.com/lukasisar/Bitmatch/pull/1` |
 
 On 2026-09-10, upstream `main` was fetched before the fork point was selected.
 It still resolved to the reviewed baseline, so there were no intervening upstream
