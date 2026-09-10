@@ -254,13 +254,15 @@ final class TransferWorkerTests: XCTestCase {
     }
 
     func testUnsupportedProtocolAndMandatoryCapabilityFailBeforeDestinationWrites() async throws {
-        let unsupportedVersion = makeJob(protocolVersion: 1)
-        let versionResult = await TransferWorkerRuntime().run(
-            job: unsupportedVersion,
-            evidenceURL: root.appendingPathComponent("unsupported-version.json")
-        )
-        XCTAssertEqual(versionResult.exitCode, .unsupportedProtocolOrCapability)
-        XCTAssertEqual(versionResult.evidence?.terminalStatus, .unsupportedProtocolOrCapability)
+        for protocolVersion in [1, 2] {
+            let unsupportedVersion = makeJob(protocolVersion: protocolVersion)
+            let versionResult = await TransferWorkerRuntime().run(
+                job: unsupportedVersion,
+                evidenceURL: root.appendingPathComponent("unsupported-version-\(protocolVersion).json")
+            )
+            XCTAssertEqual(versionResult.exitCode, .unsupportedProtocolOrCapability)
+            XCTAssertEqual(versionResult.evidence?.terminalStatus, .unsupportedProtocolOrCapability)
+        }
         try assertDestinationHasNoOutput(destinationA)
         try assertDestinationHasNoOutput(destinationB)
 
@@ -500,8 +502,37 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, unknown), .unknown)
         XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, composite), .unknown)
 
-        let renamedVolume = physical1
-        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, renamedVolume), .samePhysicalDevice)
+        let sourcePath = "/Volumes/Camera"
+        let destinations = [
+            DestinationRequest(requestID: "a", executionRoot: "/Volumes/A", role: .working),
+            DestinationRequest(requestID: "b", executionRoot: "/Volumes/B", role: .backup),
+            DestinationRequest(requestID: "c", executionRoot: "/Volumes/C", role: .optional),
+            DestinationRequest(requestID: "unknown", executionRoot: "/Volumes/Unknown", role: .optional),
+            DestinationRequest(requestID: "composite", executionRoot: "/Volumes/Composite", role: .optional),
+        ]
+        let evidence = StorageTopologyClassifier.evidence(
+            sourceURL: URL(fileURLWithPath: sourcePath, isDirectory: true),
+            destinations: destinations,
+            resolver: FakeTopologyResolver(identities: [
+                sourcePath: physical2,
+                "/Volumes/A": physical1,
+                "/Volumes/B": physical2,
+                "/Volumes/C": physical1,
+                "/Volumes/Unknown": unknown,
+                "/Volumes/Composite": composite,
+            ])
+        )
+
+        func relationship(_ first: String, _ second: String) -> PhysicalDeviceRelationship? {
+            evidence.destinationRelationships.first {
+                $0.firstRequestID == first && $0.secondRequestID == second
+            }?.relationship
+        }
+
+        XCTAssertEqual(relationship("a", "b"), .differentPhysicalDevices)
+        XCTAssertEqual(relationship("a", "c"), .samePhysicalDevice)
+        XCTAssertEqual(relationship("a", "unknown"), .unknown)
+        XCTAssertEqual(relationship("a", "composite"), .unknown)
     }
 
     func testRuntimeReportsRoleSeparatelyFromSyntheticPhysicalTopology() async throws {

@@ -928,6 +928,7 @@ class SharedFileOperationsService: FileOperationsService {
             source: operation.sourceURL,
             settings: operation.settings
         )
+        let pauseState = self.pauseState
         var targets: [FanOutDestinationTarget] = []
 
         for (destinationIndex, destinationURL) in operation.destinationURLs.enumerated() {
@@ -989,7 +990,7 @@ class SharedFileOperationsService: FileOperationsService {
                     to: targets,
                     durabilityIO: durabilityIO,
                     durabilityRecorder: durabilityRecorder,
-                    pauseCheck: { try await self.waitIfPaused() }
+                    pauseCheck: { try await pauseState.waitIfPaused() }
                 )
             } catch is CancellationError {
                 throw CancellationError()
