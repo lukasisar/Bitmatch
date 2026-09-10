@@ -284,10 +284,13 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
         let records = try detailRecords(from: result)
         XCTAssertTrue(records.contains { $0.verificationOutcome == .failed })
-        XCTAssertTrue(records.contains { $0.publication == .removedAfterFailure })
-        XCTAssertFalse(FileManager.default.fileExists(
-            atPath: destinationA.appendingPathComponent("source/camera-like-file-1.bin").path
-        ))
+        let rolledBack = records.filter { $0.publication == .removedAfterFailure }
+        XCTAssertFalse(rolledBack.isEmpty)
+        XCTAssertTrue(rolledBack.allSatisfy {
+            !FileManager.default.fileExists(
+                atPath: destinationA.appendingPathComponent("source/\($0.relativePath)").path
+            )
+        })
     }
 
     func testShortDestinationReadbackFails() async throws {
@@ -394,8 +397,10 @@ final class TransferWorkerTests: XCTestCase {
         )
 
         XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.terminalStatus, .completedWithFailures)
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-mutated" } == true)
+        XCTAssertTrue(result.evidence?.destinations.allSatisfy { $0.verificationOutcome == .failed } == true)
     }
 
     func testPublicationCollisionCannotLookCompleteAndTempIsCleaned() async throws {

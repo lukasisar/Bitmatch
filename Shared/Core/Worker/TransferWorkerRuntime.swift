@@ -289,7 +289,8 @@ public struct TransferWorkerRuntime {
                     operation: operation,
                     job: job,
                     sourceURL: sourceURL,
-                    facts: durabilityFacts
+                    facts: durabilityFacts,
+                    sourceStableAcrossAttempt: sourceStableAcrossAttempt
                 )
                 sourceSummary = makeSourceSummary(
                     sourceSummary,
@@ -302,10 +303,16 @@ public struct TransferWorkerRuntime {
                     errors.append(WorkerTypedError(code: "source-mutated", message: "Source manifest changed during the transfer attempt"))
                 }
                 let detailReference = try await writer.publish()
-                let status: TransferTerminalStatus = errors.isEmpty ? .succeeded : .completedWithFailures
                 let outcome = sourceStableAcrossAttempt
                     ? aggregateOutcome(operation: operation, facts: durabilityFacts)
                     : .failed
+                if outcome == .failed && errors.isEmpty {
+                    errors.append(WorkerTypedError(
+                        code: "verification-facts-incomplete",
+                        message: "Required verification or durability facts were incomplete"
+                    ))
+                }
+                let status: TransferTerminalStatus = outcome == .failed ? .completedWithFailures : .succeeded
                 let evidence = makeEvidence(
                     job: job,
                     startedAt: startedAt,
@@ -545,14 +552,17 @@ public struct TransferWorkerRuntime {
         operation: FileOperation,
         job: TransferJobSpec,
         sourceURL: URL,
-        facts: WorkerDurabilityFactsCollector
+        facts: WorkerDurabilityFactsCollector,
+        sourceStableAcrossAttempt: Bool
     ) -> [DestinationEvidenceSummary] {
         job.destinations.map { destination in
             let matching = operation.results.filter {
                 destinationRequestID(for: $0.destinationURL, destinations: job.destinations) == destination.requestID
             }
-            let outcomes = matching.map {
-                fileOutcome(result: $0, facts: facts.snapshot(destinationPath: $0.destinationURL.path))
+            let outcomes = matching.map { result in
+                sourceStableAcrossAttempt
+                    ? fileOutcome(result: result, facts: facts.snapshot(destinationPath: result.destinationURL.path))
+                    : .failed
             }
             return DestinationEvidenceSummary(
                 requestID: destination.requestID,
