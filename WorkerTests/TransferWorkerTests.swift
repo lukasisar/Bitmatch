@@ -76,6 +76,30 @@ final class TransferWorkerTests: XCTestCase {
         try assertDestinationHasNoOutput(destinationB)
     }
 
+    func testUnsupportedVerificationPolicyFailsClosedBeforeWrites() async throws {
+        let job = TransferJobSpec(
+            protocolVersion: 1,
+            jobID: UUID(),
+            attemptID: UUID(),
+            requestedAt: Date(),
+            sourceRoot: source.path,
+            destinations: [DestinationRequest(
+                requestID: "destination-a",
+                executionRoot: destinationA.path,
+                role: .backup
+            )],
+            verificationPolicy: .unsupported("quick"),
+            requestedCapabilities: []
+        )
+        let result = await TransferWorkerRuntime().run(
+            job: job,
+            evidenceURL: root.appendingPathComponent("unsupported-policy.json")
+        )
+        XCTAssertEqual(result.exitCode, .unsupportedProtocolOrCapability)
+        XCTAssertNil(result.evidence?.verificationPolicyUsed)
+        try assertDestinationHasNoOutput(destinationA)
+    }
+
     func testUnsafeAndNestedDestinationTopologyFailBeforeWrites() async throws {
         let insideSource = source.appendingPathComponent("unsafe-destination", isDirectory: true)
         try FileManager.default.createDirectory(at: insideSource, withIntermediateDirectories: true)
@@ -101,6 +125,18 @@ final class TransferWorkerTests: XCTestCase {
         )
         XCTAssertEqual(nestedResult.exitCode, .invalidJob)
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationA.appendingPathComponent("source").path))
+    }
+
+    func testUnsafeEvidencePathInsideSourceIsRejectedWithoutMutatingSource() async throws {
+        let before = try sourceSnapshot()
+        let evidenceInsideSource = source.appendingPathComponent("must-not-be-written.json")
+        let result = await TransferWorkerRuntime().run(job: makeJob(), evidenceURL: evidenceInsideSource)
+        XCTAssertEqual(result.exitCode, .invalidJob)
+        XCTAssertNil(result.evidence)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: evidenceInsideSource.path))
+        XCTAssertEqual(try sourceSnapshot(), before)
+        try assertDestinationHasNoOutput(destinationA)
+        try assertDestinationHasNoOutput(destinationB)
     }
 
     func testTwoDestinationTransferProducesEvidenceAndDoesNotMutateSource() async throws {

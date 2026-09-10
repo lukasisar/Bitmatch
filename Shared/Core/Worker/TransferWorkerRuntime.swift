@@ -1,6 +1,8 @@
 import CryptoKit
 import Foundation
 
+#if os(macOS)
+
 private final class HeadlessFileSystemService: FileSystemService {
     func selectSourceFolder() async -> URL? { nil }
     func selectDestinationFolders() async -> [URL] { [] }
@@ -25,9 +27,15 @@ private final class HeadlessFileSystemService: FileSystemService {
     }
 }
 
-private enum WorkerValidationError: Error {
+private enum WorkerValidationError: LocalizedError {
     case invalid(String)
     case unsupported(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalid(let message), .unsupported(let message): return message
+        }
+    }
 }
 
 private actor DetailEvidenceWriter {
@@ -35,6 +43,7 @@ private actor DetailEvidenceWriter {
     private let temporaryURL: URL
     private var handle: FileHandle?
     private var count = 0
+    private var failureMessage: String?
     private let encoder: JSONEncoder
 
     init(finalURL: URL, encoder: JSONEncoder) throws {
@@ -48,15 +57,32 @@ private actor DetailEvidenceWriter {
         self.handle = try FileHandle(forWritingTo: temporaryURL)
     }
 
-    func append(_ record: FileEvidenceRecord) throws {
-        guard let handle else { throw CocoaError(.fileWriteUnknown) }
-        var data = try encoder.encode(record)
-        data.append(0x0A)
-        try handle.write(contentsOf: data)
-        count += 1
+    func append(_ record: FileEvidenceRecord) -> Bool {
+        guard failureMessage == nil, let handle else { return false }
+        do {
+            var data = try encoder.encode(record)
+            data.append(0x0A)
+            try handle.write(contentsOf: data)
+            count += 1
+            return true
+        } catch {
+            failureMessage = error.localizedDescription
+            return false
+        }
+    }
+
+    func recordedFailure() -> String? {
+        failureMessage
     }
 
     func publish() throws -> DetailEvidenceReference {
+        if let failureMessage {
+            throw NSError(
+                domain: "BitMatchTransferWorker.Evidence",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: failureMessage]
+            )
+        }
         guard let handle else { throw CocoaError(.fileWriteUnknown) }
         try handle.close()
         self.handle = nil
@@ -69,11 +95,6 @@ private actor DetailEvidenceWriter {
         return DetailEvidenceReference(path: finalURL.path, format: "application/x-ndjson", recordCount: count, sha256: digest)
     }
 
-    func discard() {
-        try? handle?.close()
-        handle = nil
-        try? FileManager.default.removeItem(at: temporaryURL)
-    }
 }
 
 public struct TransferWorkerRuntime {
@@ -111,6 +132,17 @@ public struct TransferWorkerRuntime {
 
         do {
             try validateArtifactTargets(evidenceURL: evidenceURL, detailsURL: detailsURL, sourceURL: sourceURL)
+        } catch {
+            // The requested output path itself is unsafe or unavailable. Do
+            // not try to explain the rejection by writing to that same path.
+            return TransferWorkerRunResult(
+                exitCode: .invalidJob,
+                evidence: nil,
+                diagnostic: error.localizedDescription
+            )
+        }
+
+        do {
             try validate(job: job, sourceURL: sourceURL)
             let manifest = try FileTreeEnumerator.enumerateRegularFiles(base: sourceURL)
             let totalBytes = try manifest.reduce(Int64(0)) { partial, entry in
@@ -124,16 +156,30 @@ public struct TransferWorkerRuntime {
                 totalBytes: totalBytes
             )
 
-            let encoder = Self.makeDetailEncoder()
-            let writer = try DetailEvidenceWriter(finalURL: detailsURL, encoder: encoder)
             let destinationURLs = job.destinations.map { URL(fileURLWithPath: $0.executionRoot, isDirectory: true).standardizedFileURL }
             let settings = CameraLabelSettings(destinationPathComponents: [sourceURL.lastPathComponent])
+            do {
+                try SafetyValidator.validateResolvedDestinationRoots(
+                    source: sourceURL,
+                    destinations: destinationURLs,
+                    settings: settings
+                )
+                try await SafetyValidator.performSafetyChecks(
+                    source: sourceURL,
+                    destinations: destinationURLs,
+                    sourceSizeBytes: totalBytes
+                )
+            } catch {
+                throw WorkerValidationError.invalid(error.localizedDescription)
+            }
+
+            let encoder = Self.makeDetailEncoder()
+            let writer = try DetailEvidenceWriter(finalURL: detailsURL, encoder: encoder)
             let service = SharedFileOperationsService(
                 fileSystem: HeadlessFileSystemService(),
                 checksum: SharedChecksumService.shared,
                 pipelineVerification: true
             )
-            var callbackFailure: Error?
 
             do {
                 let operation = try await service.performFileOperation(
@@ -144,24 +190,28 @@ public struct TransferWorkerRuntime {
                     estimatedTotalBytes: totalBytes,
                     progressCallback: { _ in },
                     onFileResult: { result in
-                        do {
-                            // The shared service reports a successful copy and
-                            // then upserts it with the terminal verification.
-                            // Evidence records terminal outcomes, not progress.
-                            guard !result.success || result.verificationResult != nil else { return }
-                            let record = makeFileEvidence(
-                                result: result,
-                                sourceURL: sourceURL,
-                                destinations: job.destinations
-                            )
-                            try await writer.append(record)
-                        } catch {
-                            callbackFailure = error
+                        // The shared service reports a successful copy and
+                        // then upserts it with the terminal verification.
+                        // Evidence records terminal outcomes, not progress.
+                        guard !result.success || result.verificationResult != nil else { return }
+                        let record = makeFileEvidence(
+                            result: result,
+                            sourceURL: sourceURL,
+                            destinations: job.destinations
+                        )
+                        let recorded = await writer.append(record)
+                        if !recorded {
                             service.cancelOperation()
                         }
                     }
                 )
-                if let callbackFailure { throw callbackFailure }
+                if let callbackFailure = await writer.recordedFailure() {
+                    throw NSError(
+                        domain: "BitMatchTransferWorker.Evidence",
+                        code: 1,
+                        userInfo: [NSLocalizedDescriptionKey: callbackFailure]
+                    )
+                }
                 summaries = makeDestinationSummaries(operation: operation, job: job, sourceURL: sourceURL)
                 let errors = makeErrors(operation: operation, job: job, sourceURL: sourceURL)
                 let detailReference = try await writer.publish()
@@ -249,7 +299,7 @@ public struct TransferWorkerRuntime {
         guard !job.sourceRoot.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw WorkerValidationError.invalid("Source root must not be empty")
         }
-        guard sourceURL.path.hasPrefix("/") else {
+        guard job.sourceRoot.hasPrefix("/") else {
             throw WorkerValidationError.invalid("Source root must be absolute")
         }
         var sourceIsDirectory: ObjCBool = false
@@ -269,7 +319,7 @@ public struct TransferWorkerRuntime {
         }
 
         let destinationURLs = job.destinations.map { URL(fileURLWithPath: $0.executionRoot, isDirectory: true).standardizedFileURL }
-        guard destinationURLs.allSatisfy({ $0.path.hasPrefix("/") }) else {
+        guard job.destinations.allSatisfy({ $0.executionRoot.hasPrefix("/") }) else {
             throw WorkerValidationError.invalid("Destination roots must be absolute")
         }
         for (index, destination) in destinationURLs.enumerated() {
@@ -426,9 +476,6 @@ public struct TransferWorkerRuntime {
     }
 
     private func classifyExecutionError(_ error: Error) -> (status: TransferTerminalStatus, exit: TransferWorkerExitCode, code: String) {
-        if error is FileOperationError || error is BitMatchError {
-            return (.invalidJob, .invalidJob, "preflight-rejected")
-        }
         return (.internalFailure, .internalFailure, "internal-failure")
     }
 
@@ -501,3 +548,4 @@ private func makeFileEvidence(
         error: typedError
     )
 }
+#endif

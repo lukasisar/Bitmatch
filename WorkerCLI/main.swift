@@ -27,6 +27,10 @@ struct BitMatchTransferWorkerCommand {
             writeError("Usage: bitmatch-transfer-worker capabilities --json | run --job <job.json> --evidence <evidence.json>")
             Darwin.exit(64)
         }
+        guard arguments[2].hasPrefix("/"), arguments[4].hasPrefix("/") else {
+            writeError("Job and evidence paths must be absolute")
+            Darwin.exit(TransferWorkerExitCode.invalidJob.rawValue)
+        }
 
         do {
             let jobURL = URL(fileURLWithPath: arguments[2])
