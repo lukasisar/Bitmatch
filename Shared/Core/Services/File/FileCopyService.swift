@@ -16,6 +16,7 @@ struct TransferCopyDurabilityFacts: Equatable, Sendable {
     var fullSync: TransferSystemCallOutcome?
     var prePublicationChecksumMatched = false
     var publicationSucceeded = false
+    var publicationRemovedAfterFailure = false
     var reusedExistingDestination = false
     var directorySync: TransferSystemCallOutcome?
     var sourceRemainedStable = false
@@ -40,6 +41,7 @@ protocol TransferDurabilityIO: Sendable {
 protocol TransferDurabilityRecorder: Sendable {
     func recordCopyFacts(_ facts: TransferCopyDurabilityFacts, destinationPath: String)
     func recordReadbackFacts(_ facts: TransferReadbackFacts, destinationPath: String)
+    func copyFacts(destinationPath: String) -> TransferCopyDurabilityFacts?
 }
 
 struct DarwinTransferDurabilityIO: TransferDurabilityIO {
@@ -204,6 +206,20 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
         removeItem(named: temporaryName, relativeTo: parentFD)
     }
 
+    static func removePublishedFile(
+        named name: String,
+        relativeTo parentFD: Int32,
+        expected: stat
+    ) -> Bool {
+        var actual = stat()
+        let inspected = name.withCString { fstatat(parentFD, $0, &actual, AT_SYMLINK_NOFOLLOW) }
+        guard inspected == 0,
+              (actual.st_mode & S_IFMT) == S_IFREG,
+              actual.st_dev == expected.st_dev,
+              actual.st_ino == expected.st_ino else { return false }
+        return name.withCString { unlinkat(parentFD, $0, 0) } == 0
+    }
+
     /// Descends from `/` one descriptor at a time so `O_NOFOLLOW` protects
     /// every selected-destination component, not merely the final one.
     private static func openDirectory(at url: URL, description: String) throws -> Int32 {
@@ -359,6 +375,19 @@ final class PinnedDestinationFile: @unchecked Sendable {
             throw FileCopyService.existingDestinationConflictError("Pinned destination file changed before readback")
         }
         return (readerFD, expected)
+    }
+
+    func removeNamedFileIfStillThisFile() -> Bool {
+        guard let expected = try? snapshot() else { return false }
+        return PinnedDestinationDirectory.removePublishedFile(
+            named: name,
+            relativeTo: parentFD,
+            expected: expected
+        )
+    }
+
+    func synchronizeParent(using durabilityIO: any TransferDurabilityIO) {
+        _ = durabilityIO.syncDirectory(fileDescriptor: parentFD)
     }
 
     private static func openRegularFile(named name: String, relativeTo parentFD: Int32) throws -> Int32 {
@@ -922,22 +951,31 @@ final class FileCopyService {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to preserve destination modification date"])
             }
         }
-        try destinationHandle.close()
-        destinationClosed = true
         try durabilityIO?.prepareForPublication(destinationPath: destinationPath)
         try PinnedDestinationDirectory.publishTemporaryFile(named: temporaryName, as: filename, relativeTo: parentFD)
-        published = true
         durabilityFacts.publicationSucceeded = true
         if let durabilityIO {
             let directorySync = durabilityIO.syncDirectory(fileDescriptor: parentFD)
             durabilityFacts.directorySync = directorySync
             durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
             if case .failed = directorySync {
+                if PinnedDestinationDirectory.removePublishedFile(
+                    named: filename,
+                    relativeTo: parentFD,
+                    expected: temporaryInfo
+                ) {
+                    durabilityFacts.publicationSucceeded = false
+                    durabilityFacts.publicationRemovedAfterFailure = true
+                    _ = durabilityIO.syncDirectory(fileDescriptor: parentFD)
+                    durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+                }
                 throw TransferDurabilityError.syscall("destination directory fsync", outcome: directorySync)
             }
-        } else {
-            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
         }
+        published = true
+        try destinationHandle.close()
+        destinationClosed = true
+        durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
     }
     #endif
 
@@ -1190,13 +1228,33 @@ final class FileCopyService {
         let startTime = Date()
 
         if verificationMode == .standard, let durabilityIO {
-            return try await durableSHA256Verification(
-                source: source,
-                destination: destination,
-                destinationPath: pinnedRoot.destinationURL(for: relativePath).path,
-                durabilityIO: durabilityIO,
-                durabilityRecorder: durabilityRecorder
-            )
+            let destinationPath = pinnedRoot.destinationURL(for: relativePath).path
+            do {
+                let result = try await durableSHA256Verification(
+                    source: source,
+                    destination: destination,
+                    destinationPath: destinationPath,
+                    durabilityIO: durabilityIO,
+                    durabilityRecorder: durabilityRecorder
+                )
+                if !result.matches {
+                    rollbackWorkerPublication(
+                        destination: destination,
+                        destinationPath: destinationPath,
+                        durabilityIO: durabilityIO,
+                        durabilityRecorder: durabilityRecorder
+                    )
+                }
+                return result
+            } catch {
+                rollbackWorkerPublication(
+                    destination: destination,
+                    destinationPath: destinationPath,
+                    durabilityIO: durabilityIO,
+                    durabilityRecorder: durabilityRecorder
+                )
+                throw error
+            }
         }
 
         if verificationMode == .paranoid {
@@ -1253,6 +1311,22 @@ final class FileCopyService {
             processingTime: totalProcessing,
             fileSize: base.fileSize
         )
+    }
+
+    private static func rollbackWorkerPublication(
+        destination: PinnedDestinationFile,
+        destinationPath: String,
+        durabilityIO: any TransferDurabilityIO,
+        durabilityRecorder: (any TransferDurabilityRecorder)?
+    ) {
+        guard var copy = durabilityRecorder?.copyFacts(destinationPath: destinationPath),
+              copy.publicationSucceeded,
+              !copy.reusedExistingDestination,
+              destination.removeNamedFileIfStillThisFile() else { return }
+        copy.publicationSucceeded = false
+        copy.publicationRemovedAfterFailure = true
+        durabilityRecorder?.recordCopyFacts(copy, destinationPath: destinationPath)
+        destination.synchronizeParent(using: durabilityIO)
     }
 
     private static func durableSHA256Verification(

@@ -2,6 +2,7 @@ import CryptoKit
 import Foundation
 
 #if os(macOS)
+import Darwin
 
 private final class HeadlessFileSystemService: FileSystemService {
     func selectSourceFolder() async -> URL? { nil }
@@ -118,11 +119,26 @@ private final class WorkerDurabilityFactsCollector: TransferDurabilityRecorder, 
         lock.unlock()
     }
 
+    func copyFacts(destinationPath: String) -> TransferCopyDurabilityFacts? {
+        lock.lock()
+        defer { lock.unlock() }
+        return facts[destinationPath]?.copy
+    }
+
     func snapshot(destinationPath: String) -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
         return facts[destinationPath] ?? Snapshot()
     }
+}
+
+private struct SourceAttemptFileSnapshot: Equatable {
+    let relativePath: String
+    let device: UInt64
+    let inode: UInt64
+    let size: Int64
+    let modificationSeconds: Int
+    let modificationNanoseconds: Int
 }
 
 public struct TransferWorkerRuntime {
@@ -191,6 +207,7 @@ public struct TransferWorkerRuntime {
         do {
             try validate(job: job, sourceURL: sourceURL)
             let manifest = try FileTreeEnumerator.enumerateRegularFiles(base: sourceURL)
+            let sourceAttemptSnapshot = try captureSourceAttemptSnapshot(manifest)
             let totalBytes = try manifest.reduce(Int64(0)) { partial, entry in
                 let (sum, overflow) = partial.addingReportingOverflow(entry.size)
                 guard !overflow else { throw WorkerValidationError.invalid("Source size exceeds the supported range") }
@@ -264,7 +281,10 @@ public struct TransferWorkerRuntime {
                         userInfo: [NSLocalizedDescriptionKey: callbackFailure]
                     )
                 }
-                let sourceStableAcrossAttempt = sourceManifestRemainedStable(manifest, sourceURL: sourceURL)
+                let sourceStableAcrossAttempt = sourceManifestRemainedStable(
+                    sourceAttemptSnapshot,
+                    sourceURL: sourceURL
+                )
                 summaries = makeDestinationSummaries(
                     operation: operation,
                     job: job,
@@ -580,14 +600,31 @@ public struct TransferWorkerRuntime {
         )
     }
 
-    private func sourceManifestRemainedStable(_ initial: [FileEntry], sourceURL: URL) -> Bool {
-        guard let final = try? FileTreeEnumerator.enumerateRegularFiles(base: sourceURL),
-              final.count == initial.count else { return false }
-        let initialFacts = initial.map { ($0.relativePath, $0.size, $0.modificationDate) }.sorted { $0.0 < $1.0 }
-        let finalFacts = final.map { ($0.relativePath, $0.size, $0.modificationDate) }.sorted { $0.0 < $1.0 }
-        return zip(initialFacts, finalFacts).allSatisfy { left, right in
-            left.0 == right.0 && left.1 == right.1 && left.2 == right.2
-        }
+    private func captureSourceAttemptSnapshot(_ manifest: [FileEntry]) throws -> [SourceAttemptFileSnapshot] {
+        try manifest.map { entry in
+            var info = stat()
+            let result = entry.url.path.withCString { lstat($0, &info) }
+            guard result == 0, (info.st_mode & S_IFMT) == S_IFREG else {
+                throw WorkerValidationError.invalid("Unable to capture stable identity for source file \(entry.relativePath)")
+            }
+            return SourceAttemptFileSnapshot(
+                relativePath: entry.relativePath,
+                device: UInt64(info.st_dev),
+                inode: UInt64(info.st_ino),
+                size: Int64(info.st_size),
+                modificationSeconds: info.st_mtimespec.tv_sec,
+                modificationNanoseconds: info.st_mtimespec.tv_nsec
+            )
+        }.sorted { $0.relativePath < $1.relativePath }
+    }
+
+    private func sourceManifestRemainedStable(
+        _ initial: [SourceAttemptFileSnapshot],
+        sourceURL: URL
+    ) -> Bool {
+        guard let finalManifest = try? FileTreeEnumerator.enumerateRegularFiles(base: sourceURL),
+              let final = try? captureSourceAttemptSnapshot(finalManifest) else { return false }
+        return initial == final
     }
 
     private func aggregateOutcome(
@@ -792,7 +829,11 @@ private func makeFileEvidence(
         cacheBypass: operationFact(readback.cacheBypass),
         durabilityFlush: operationFact(copy.fullSync),
         directoryMetadataFlush: operationFact(copy.directorySync),
-        publication: copy.reusedExistingDestination ? .reusedExisting : copy.publicationSucceeded ? .published : .notPublished,
+        publication: copy.reusedExistingDestination
+            ? .reusedExisting
+            : copy.publicationRemovedAfterFailure
+                ? .removedAfterFailure
+                : copy.publicationSucceeded ? .published : .notPublished,
         error: typedError
     )
 }

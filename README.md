@@ -156,7 +156,12 @@ checksum-verified transfers:
 
 It reuses BitMatch's hardened copy/verify core, never consults GUI preferences
 to weaken verification, and has no project-database or card-clearing authority.
-See [the V1 protocol contract](docs/TRANSFER_WORKER_PROTOCOL.md) and
+Protocol V2 reports strong, degraded, or failed facts after temporary-file
+SHA-256 verification, best-effort Darwin durability requests, atomic
+no-overwrite publication, and a complete independently reopened destination
+readback. `F_FULLFSYNC` and `F_NOCACHE` are recorded precisely; neither is
+presented as proof that bytes physically reside on or were reread from media.
+See [the V2 protocol contract](docs/TRANSFER_WORKER_PROTOCOL.md) and
 [upstream provenance](UPSTREAM.md).
 
 ## FAQ

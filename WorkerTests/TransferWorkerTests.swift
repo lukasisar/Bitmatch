@@ -89,6 +89,21 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(defaulted.verificationPolicy, .sha256)
     }
 
+    func testFutureEvidenceVersionIsRejectedBeforeFieldsAreTrusted() async throws {
+        let result = await TransferWorkerRuntime().run(
+            job: makeJob(),
+            evidenceURL: root.appendingPathComponent("versioned-evidence.json")
+        )
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(
+            with: TransferWorkerRuntime.makeEncoder().encode(try XCTUnwrap(result.evidence))
+        ) as? [String: Any])
+        object["protocolVersion"] = 999
+        let future = try JSONSerialization.data(withJSONObject: object)
+        XCTAssertThrowsError(
+            try TransferWorkerRuntime.makeDecoder().decode(TransferEvidence.self, from: future)
+        )
+    }
+
     func testCapabilitiesAreDeterministicAndDescribeReadOnlySHA256Worker() throws {
         let runtime = TransferWorkerRuntime()
         let first = try TransferWorkerRuntime.makeEncoder().encode(runtime.capabilities())
@@ -101,7 +116,7 @@ final class TransferWorkerTests: XCTestCase {
     }
 
     func testUnsupportedProtocolAndMandatoryCapabilityFailBeforeDestinationWrites() async throws {
-        let unsupportedVersion = makeJob(protocolVersion: 99)
+        let unsupportedVersion = makeJob(protocolVersion: 1)
         let versionResult = await TransferWorkerRuntime().run(
             job: unsupportedVersion,
             evidenceURL: root.appendingPathComponent("unsupported-version.json")
@@ -267,7 +282,12 @@ final class TransferWorkerTests: XCTestCase {
 
         XCTAssertEqual(result.exitCode, .completedWithFailures)
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
-        XCTAssertTrue(try detailRecords(from: result).contains { $0.verificationOutcome == .failed })
+        let records = try detailRecords(from: result)
+        XCTAssertTrue(records.contains { $0.verificationOutcome == .failed })
+        XCTAssertTrue(records.contains { $0.publication == .removedAfterFailure })
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destinationA.appendingPathComponent("source/camera-like-file-1.bin").path
+        ))
     }
 
     func testShortDestinationReadbackFails() async throws {
@@ -281,6 +301,7 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, .completedWithFailures)
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "short-readback" } == true)
+        XCTAssertTrue(try detailRecords(from: result).contains { $0.publication == .removedAfterFailure })
     }
 
     func testFullSyncFailureCannotReportStrongOrPublishFinalFile() async throws {
@@ -311,6 +332,22 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertTrue(try detailRecords(from: result).allSatisfy { $0.durabilityFlush.status == .unsupported })
     }
 
+    func testDirectorySyncFailureRollsBackPublishedFile() async throws {
+        let io = FaultingDurabilityIO()
+        io.directorySyncOutcome = .failed(code: EIO, message: "simulated directory sync failure")
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)]),
+            evidenceURL: root.appendingPathComponent("directory-sync-failure.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destinationA.appendingPathComponent("source/camera-like-file-1.bin").path
+        ))
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "directory-flush-failed" } == true)
+    }
+
     func testUnsupportedCacheBypassIsExplicitlyDegraded() async throws {
         let io = FaultingDurabilityIO()
         io.cacheBypassOutcome = .unsupported(code: ENOTSUP, message: "simulated unsupported cache bypass")
@@ -324,6 +361,20 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertTrue(try detailRecords(from: result).allSatisfy {
             $0.cacheBypass.status == .unsupported && $0.fullDestinationReadbackPerformed
         })
+    }
+
+    func testCacheBypassFailureRollsBackNewPublication() async throws {
+        let io = FaultingDurabilityIO()
+        io.cacheBypassOutcome = .failed(code: EIO, message: "simulated cache bypass failure")
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)]),
+            evidenceURL: root.appendingPathComponent("nocache-failure.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "cache-bypass-failed" } == true)
+        XCTAssertTrue(try detailRecords(from: result).contains { $0.publication == .removedAfterFailure })
     }
 
     func testSourceMutationBetweenCopyAndReadbackIsCaught() async throws {
