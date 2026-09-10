@@ -14,14 +14,29 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     var corruptReadback = false
     var publicationHook: ((String) throws -> Void)?
     var sourceVerificationHook: ((String) throws -> Void)?
+    var destinationWriteHook: ((String, Int) throws -> Void)?
     var fullSyncObserver: ((Int32) -> Void)?
     private let lock = NSLock()
     private var readCallsStorage = 0
+    private var sourceReadCallsStorage = 0
+    private var sourceBytesReadStorage: Int64 = 0
 
     var readCalls: Int {
         lock.lock()
         defer { lock.unlock() }
         return readCallsStorage
+    }
+
+    var sourceReadCalls: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return sourceReadCallsStorage
+    }
+
+    var sourceBytesRead: Int64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return sourceBytesReadStorage
     }
 
     func fullSync(fileDescriptor: Int32) -> TransferSystemCallOutcome {
@@ -32,6 +47,20 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     func requestCacheBypass(fileDescriptor: Int32) -> TransferSystemCallOutcome { cacheBypassOutcome }
     func prepareForPublication(destinationPath: String) throws { try publicationHook?(destinationPath) }
     func prepareForSourceVerification(sourcePath: String) throws { try sourceVerificationHook?(sourcePath) }
+    func prepareForDestinationChunkWrite(destinationPath: String, byteCount: Int) throws {
+        try destinationWriteHook?(destinationPath, byteCount)
+    }
+
+    func readSource(fileDescriptor: Int32, maximumCount: Int) throws -> Data {
+        var buffer = [UInt8](repeating: 0, count: maximumCount)
+        let count = Darwin.read(fileDescriptor, &buffer, maximumCount)
+        guard count >= 0 else { throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno)) }
+        lock.lock()
+        sourceReadCallsStorage += 1
+        sourceBytesReadStorage += Int64(count)
+        lock.unlock()
+        return Data(buffer.prefix(count))
+    }
 
     func readDestination(fileDescriptor: Int32, maximumCount: Int) throws -> Data {
         lock.lock()
@@ -50,6 +79,15 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
             data[data.startIndex] ^= 0xff
         }
         return data
+    }
+}
+
+private struct FakeTopologyResolver: StorageTopologyResolving {
+    let identities: [String: StorageIdentityEvidence]
+
+    func resolveStorage(for url: URL) -> StorageIdentityEvidence {
+        identities[url.standardizedFileURL.path]
+            ?? .unknown(basis: "synthetic", detail: "No fixture topology")
     }
 }
 #endif
@@ -114,7 +152,7 @@ final class TransferWorkerTests: XCTestCase {
         let second = try TransferWorkerRuntime.makeEncoder().encode(runtime.capabilities())
         XCTAssertEqual(first, second)
         XCTAssertTrue(runtime.capabilities().sourceReadOnly)
-        XCTAssertEqual(runtime.capabilities().supportedProtocolVersions, [2])
+        XCTAssertEqual(runtime.capabilities().supportedProtocolVersions, [3])
         XCTAssertEqual(runtime.capabilities().supportedVerificationPolicies, ["sha256"])
         XCTAssertEqual(runtime.capabilities().upstreamRevision, TransferWorkerIdentity.upstreamRevision)
     }
@@ -216,13 +254,15 @@ final class TransferWorkerTests: XCTestCase {
     }
 
     func testUnsupportedProtocolAndMandatoryCapabilityFailBeforeDestinationWrites() async throws {
-        let unsupportedVersion = makeJob(protocolVersion: 1)
-        let versionResult = await TransferWorkerRuntime().run(
-            job: unsupportedVersion,
-            evidenceURL: root.appendingPathComponent("unsupported-version.json")
-        )
-        XCTAssertEqual(versionResult.exitCode, .unsupportedProtocolOrCapability)
-        XCTAssertEqual(versionResult.evidence?.terminalStatus, .unsupportedProtocolOrCapability)
+        for protocolVersion in [1, 2] {
+            let unsupportedVersion = makeJob(protocolVersion: protocolVersion)
+            let versionResult = await TransferWorkerRuntime().run(
+                job: unsupportedVersion,
+                evidenceURL: root.appendingPathComponent("unsupported-version-\(protocolVersion).json")
+            )
+            XCTAssertEqual(versionResult.exitCode, .unsupportedProtocolOrCapability)
+            XCTAssertEqual(versionResult.evidence?.terminalStatus, .unsupportedProtocolOrCapability)
+        }
         try assertDestinationHasNoOutput(destinationA)
         try assertDestinationHasNoOutput(destinationB)
 
@@ -341,6 +381,189 @@ final class TransferWorkerTests: XCTestCase {
             }
         }
         XCTAssertEqual(try sourceSnapshot(), before)
+    }
+
+    func testFanOutReadsEachSourceTransferStreamOnceForTwoDestinations() async throws {
+        let io = FaultingDurabilityIO()
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(),
+            evidenceURL: root.appendingPathComponent("fanout-two.json")
+        )
+
+        let sourceEvidence = try XCTUnwrap(result.evidence?.source)
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(sourceEvidence.transferReadPasses, sourceEvidence.fileCount)
+        XCTAssertEqual(sourceEvidence.transferBytesRead, sourceEvidence.totalBytes)
+        XCTAssertEqual(io.sourceBytesRead, sourceEvidence.totalBytes)
+        XCTAssertLessThanOrEqual(sourceEvidence.maximumBufferedBytes, FileCopyService.fanOutMaximumBufferedBytes)
+    }
+
+    func testFanOutReadsEachSourceOnceForNDestinations() async throws {
+        let destinationC = root.appendingPathComponent("destination-c", isDirectory: true)
+        try FileManager.default.createDirectory(at: destinationC, withIntermediateDirectories: true)
+        let io = FaultingDurabilityIO()
+        let destinations = [
+            DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .working),
+            DestinationRequest(requestID: "b", executionRoot: destinationB.path, role: .backup),
+            DestinationRequest(requestID: "c", executionRoot: destinationC.path, role: .optional),
+        ]
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: destinations),
+            evidenceURL: root.appendingPathComponent("fanout-n.json")
+        )
+
+        let sourceEvidence = try XCTUnwrap(result.evidence?.source)
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(sourceEvidence.transferReadPasses, sourceEvidence.fileCount)
+        XCTAssertEqual(io.sourceBytesRead, sourceEvidence.totalBytes)
+        XCTAssertEqual(result.evidence?.destinations.count, 3)
+        XCTAssertTrue(result.evidence?.destinations.allSatisfy { $0.verificationOutcome == .verifiedStrong } == true)
+    }
+
+    func testSlowDestinationAppliesBoundedBackpressureWithoutCorruption() async throws {
+        try installLargeSyntheticSource(byteCount: 12 * 1024 * 1024 + 17)
+        let io = FaultingDurabilityIO()
+        io.destinationWriteHook = { path, _ in
+            if path.contains("destination-b") { usleep(2_000) }
+        }
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(),
+            evidenceURL: root.appendingPathComponent("slow-destination.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(result.evidence?.source.maximumBufferedBytes, FileCopyService.fanOutMaximumBufferedBytes)
+        XCTAssertTrue(result.evidence?.destinations.allSatisfy { $0.verificationOutcome == .verifiedStrong } == true)
+    }
+
+    func testDestinationFailureIsIsolatedAndRemainsInExactAccounting() async throws {
+        try installLargeSyntheticSource(byteCount: 10 * 1024 * 1024)
+        let io = FaultingDurabilityIO()
+        var failed = false
+        io.destinationWriteHook = { path, _ in
+            if path.contains("destination-b"), !failed {
+                failed = true
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(ENXIO))
+            }
+        }
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(),
+            evidenceURL: root.appendingPathComponent("isolated-failure.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+        XCTAssertEqual(result.evidence?.destinations.first { $0.requestID == "destination-a" }?.verificationOutcome, .verifiedStrong)
+        XCTAssertEqual(result.evidence?.destinations.first { $0.requestID == "destination-b" }?.verificationOutcome, .failed)
+        XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationB.appendingPathComponent("source/large.bin").path))
+        XCTAssertEqual(try digest(source.appendingPathComponent("large.bin")), try digest(destinationA.appendingPathComponent("source/large.bin")))
+    }
+
+    func testCancellationCleansOnlyWorkerOwnedIncompleteFiles() async throws {
+        try installLargeSyntheticSource(byteCount: 24 * 1024 * 1024)
+        let io = FaultingDurabilityIO()
+        io.destinationWriteHook = { _, _ in usleep(15_000) }
+        let task = Task {
+            await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(),
+                evidenceURL: root.appendingPathComponent("cancelled.json")
+            )
+        }
+        try await Task.sleep(nanoseconds: 40_000_000)
+        task.cancel()
+        let result = await task.value
+
+        XCTAssertEqual(result.exitCode, .interrupted)
+        XCTAssertFalse(try recursiveNames(in: destinationA).contains { $0.hasPrefix(".bitmatch.tmp.") })
+        XCTAssertFalse(try recursiveNames(in: destinationB).contains { $0.hasPrefix(".bitmatch.tmp.") })
+    }
+
+    func testSyntheticPhysicalTopologyClassifiesSameDifferentRenameUnknownAndComposite() {
+        let physical1 = StorageIdentityEvidence(
+            resolutionStatus: .resolved,
+            physicalLeafIdentifiers: ["physical-1"],
+            basis: "synthetic"
+        )
+        let physical2 = StorageIdentityEvidence(
+            resolutionStatus: .resolved,
+            physicalLeafIdentifiers: ["physical-2"],
+            basis: "synthetic"
+        )
+        let unknown = StorageIdentityEvidence.unknown(basis: "synthetic", detail: "unresolved")
+        let composite = StorageIdentityEvidence(
+            resolutionStatus: .resolved,
+            physicalLeafIdentifiers: ["physical-1", "physical-2"],
+            basis: "synthetic-composite"
+        )
+
+        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, physical1), .samePhysicalDevice)
+        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, physical2), .differentPhysicalDevices)
+        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, unknown), .unknown)
+        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, composite), .unknown)
+
+        let sourcePath = "/Volumes/Camera"
+        let destinations = [
+            DestinationRequest(requestID: "a", executionRoot: "/Volumes/A", role: .working),
+            DestinationRequest(requestID: "b", executionRoot: "/Volumes/B", role: .backup),
+            DestinationRequest(requestID: "c", executionRoot: "/Volumes/C", role: .optional),
+            DestinationRequest(requestID: "unknown", executionRoot: "/Volumes/Unknown", role: .optional),
+            DestinationRequest(requestID: "composite", executionRoot: "/Volumes/Composite", role: .optional),
+        ]
+        let evidence = StorageTopologyClassifier.evidence(
+            sourceURL: URL(fileURLWithPath: sourcePath, isDirectory: true),
+            destinations: destinations,
+            resolver: FakeTopologyResolver(identities: [
+                sourcePath: physical2,
+                "/Volumes/A": physical1,
+                "/Volumes/B": physical2,
+                "/Volumes/C": physical1,
+                "/Volumes/Unknown": unknown,
+                "/Volumes/Composite": composite,
+            ])
+        )
+
+        func relationship(_ first: String, _ second: String) -> PhysicalDeviceRelationship? {
+            evidence.destinationRelationships.first {
+                $0.firstRequestID == first && $0.secondRequestID == second
+            }?.relationship
+        }
+
+        XCTAssertEqual(relationship("a", "b"), .differentPhysicalDevices)
+        XCTAssertEqual(relationship("a", "c"), .samePhysicalDevice)
+        XCTAssertEqual(relationship("a", "unknown"), .unknown)
+        XCTAssertEqual(relationship("a", "composite"), .unknown)
+    }
+
+    func testRuntimeReportsRoleSeparatelyFromSyntheticPhysicalTopology() async throws {
+        let resolver = FakeTopologyResolver(identities: [
+            source.standardizedFileURL.path: .init(
+                resolutionStatus: .resolved,
+                physicalLeafIdentifiers: ["camera"],
+                basis: "synthetic"
+            ),
+            destinationA.standardizedFileURL.path: .init(
+                resolutionStatus: .resolved,
+                physicalLeafIdentifiers: ["physical-1"],
+                basis: "synthetic"
+            ),
+            destinationB.standardizedFileURL.path: .init(
+                resolutionStatus: .resolved,
+                physicalLeafIdentifiers: ["physical-2"],
+                basis: "synthetic"
+            ),
+        ])
+        let result = await TransferWorkerRuntime(
+            durabilityIO: FaultingDurabilityIO(),
+            topologyResolver: resolver
+        ).run(job: makeJob(), evidenceURL: root.appendingPathComponent("topology.json"))
+
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(result.evidence?.destinations.map(\.role), [.working, .backup])
+        XCTAssertEqual(
+            result.evidence?.storageTopology.destinationRelationships.first?.relationship,
+            .differentPhysicalDevices
+        )
     }
 
     func testConflictingExistingFileIsNotOverwrittenOrReportedAsSuccess() async throws {
@@ -640,6 +863,29 @@ final class TransferWorkerTests: XCTestCase {
     private func assertDestinationHasNoOutput(_ destination: URL) throws {
         let items = try FileManager.default.contentsOfDirectory(atPath: destination.path)
         XCTAssertTrue(items.isEmpty, "Unexpected destination writes: \(items)")
+    }
+
+    private func installLargeSyntheticSource(byteCount: Int) throws {
+        try FileManager.default.removeItem(at: source)
+        try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+        let file = source.appendingPathComponent("large.bin")
+        FileManager.default.createFile(atPath: file.path, contents: nil)
+        let handle = try FileHandle(forWritingTo: file)
+        defer { try? handle.close() }
+        let chunk = Data(repeating: 0x5a, count: 1024 * 1024)
+        var remaining = byteCount
+        while remaining > 0 {
+            let count = min(remaining, chunk.count)
+            try handle.write(contentsOf: chunk.prefix(count))
+            remaining -= count
+        }
+    }
+
+    private func recursiveNames(in root: URL) throws -> [String] {
+        guard let enumerator = FileManager.default.enumerator(at: root, includingPropertiesForKeys: nil) else {
+            return []
+        }
+        return enumerator.compactMap { ($0 as? URL)?.lastPathComponent }
     }
 
     private func detailRecords(from result: TransferWorkerRunResult) throws -> [FileEvidenceRecord] {

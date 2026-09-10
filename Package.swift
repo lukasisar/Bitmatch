@@ -68,6 +68,7 @@ let package = Package(
                 "Core/Services/AsyncSemaphore.swift",
                 "Core/Services/ChecksumCache.swift",
                 "Core/Services/File/FileCopyService.swift",
+                "Core/Services/File/FanOutCopyService.swift",
                 "Core/Services/File/FileTreeEnumerator.swift",
                 "Core/Services/File/SafetyValidator.swift",
                 "Core/Services/Logging/SharedLogger.swift",
@@ -76,6 +77,7 @@ let package = Package(
                 "Core/Services/SharedFileOperationsService.swift",
                 "Core/Worker/TransferWorkerProtocol.swift",
                 "Core/Worker/TransferWorkerRuntime.swift",
+                "Core/Worker/StorageTopology.swift",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

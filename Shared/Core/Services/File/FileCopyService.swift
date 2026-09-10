@@ -29,6 +29,12 @@ struct TransferReadbackFacts: Equatable, Sendable {
     var sourceRemainedStable = false
 }
 
+struct TransferSourceReadFacts: Equatable, Sendable {
+    let readPasses: Int
+    let bytesRead: Int64
+    let maximumBufferedBytes: Int
+}
+
 protocol TransferDurabilityIO: Sendable {
     func fullSync(fileDescriptor: Int32) -> TransferSystemCallOutcome
     func syncDirectory(fileDescriptor: Int32) -> TransferSystemCallOutcome
@@ -36,12 +42,39 @@ protocol TransferDurabilityIO: Sendable {
     func readDestination(fileDescriptor: Int32, maximumCount: Int) throws -> Data
     func prepareForPublication(destinationPath: String) throws
     func prepareForSourceVerification(sourcePath: String) throws
+    func prepareForSourceTransfer(sourcePath: String) throws
+    func readSource(fileDescriptor: Int32, maximumCount: Int) throws -> Data
+    func prepareForDestinationChunkWrite(destinationPath: String, byteCount: Int) throws
+}
+
+extension TransferDurabilityIO {
+    func prepareForSourceTransfer(sourcePath: String) throws {}
+
+    func readSource(fileDescriptor: Int32, maximumCount: Int) throws -> Data {
+        var buffer = [UInt8](repeating: 0, count: maximumCount)
+        let count = Darwin.read(fileDescriptor, &buffer, maximumCount)
+        guard count >= 0 else {
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(errno),
+                userInfo: [NSLocalizedDescriptionKey: "Source read failed: " + String(cString: strerror(errno))]
+            )
+        }
+        return Data(buffer.prefix(count))
+    }
+
+    func prepareForDestinationChunkWrite(destinationPath: String, byteCount: Int) throws {}
 }
 
 protocol TransferDurabilityRecorder: Sendable {
     func recordCopyFacts(_ facts: TransferCopyDurabilityFacts, destinationPath: String)
     func recordReadbackFacts(_ facts: TransferReadbackFacts, destinationPath: String)
     func copyFacts(destinationPath: String) -> TransferCopyDurabilityFacts?
+    func recordSourceReadFacts(_ facts: TransferSourceReadFacts, sourcePath: String)
+}
+
+extension TransferDurabilityRecorder {
+    func recordSourceReadFacts(_ facts: TransferSourceReadFacts, sourcePath: String) {}
 }
 
 struct DarwinTransferDurabilityIO: TransferDurabilityIO {

@@ -215,6 +215,7 @@ class SharedFileOperationsService: FileOperationsService {
     private let pipelineVerification: Bool
     private let durabilityIO: (any TransferDurabilityIO)?
     private let durabilityRecorder: (any TransferDurabilityRecorder)?
+    private let singleSourceReadFanOut: Bool
     /// Test seam invoked with the raw destination URL immediately before that
     /// destination is pinned. It performs no filesystem work in production
     /// (nil); tests use it to block or fail destination setup deterministically.
@@ -244,7 +245,8 @@ class SharedFileOperationsService: FileOperationsService {
         pipelineVerification: Bool = !UserDefaults.standard.bool(forKey: "DisablePipelinedVerify"),
         destinationSetupHook: (@Sendable (URL) throws -> Void)? = nil,
         durabilityIO: (any TransferDurabilityIO)? = nil,
-        durabilityRecorder: (any TransferDurabilityRecorder)? = nil
+        durabilityRecorder: (any TransferDurabilityRecorder)? = nil,
+        singleSourceReadFanOut: Bool = false
     ) {
         self.fileSystem = fileSystem
         self.checksumService = checksum
@@ -252,6 +254,7 @@ class SharedFileOperationsService: FileOperationsService {
         self.destinationSetupHook = destinationSetupHook
         self.durabilityIO = durabilityIO
         self.durabilityRecorder = durabilityRecorder
+        self.singleSourceReadFanOut = singleSourceReadFanOut
     }
     
     // MARK: - FileOperationsService Protocol Implementation
@@ -447,6 +450,27 @@ class SharedFileOperationsService: FileOperationsService {
         let maxQueuedVerifyTasks = 200
         // Perf 2: time-based throttle on progress callbacks (500ms)
         let progressThrottleInterval: TimeInterval = 0.5
+
+        #if canImport(Darwin)
+        if singleSourceReadFanOut {
+            guard operation.verificationMode == .standard, let durabilityIO else {
+                throw FileOperationError.unsafeOperation("Single-source-read fan-out requires Standard SHA-256 durability verification")
+            }
+            return try await executeSingleSourceReadFanOut(
+                operation,
+                sourceManifest: sourceManifest,
+                resultStore: resultStore,
+                destinationProgress: destProgress,
+                progressState: progressState,
+                totalFiles: totalFiles,
+                totalStageUnits: totalStageUnits,
+                startTime: startTime,
+                progressCallback: progressCallback,
+                onFileResult: onFileResult,
+                durabilityIO: durabilityIO
+            )
+        }
+        #endif
         
         let sourceFileURLs = sourceManifest.map(\.url)
         // Perf 7: adaptive copy worker count
@@ -885,4 +909,255 @@ class SharedFileOperationsService: FileOperationsService {
             throw error
         }
     }
+
+    #if canImport(Darwin)
+    private func executeSingleSourceReadFanOut(
+        _ operation: FileOperation,
+        sourceManifest: [FileEntry],
+        resultStore: ResultStore,
+        destinationProgress: DestinationProgress,
+        progressState: ProgressState,
+        totalFiles: Int,
+        totalStageUnits: Int,
+        startTime: Date,
+        progressCallback: @escaping ProgressCallback,
+        onFileResult: FileResultCallback?,
+        durabilityIO: any TransferDurabilityIO
+    ) async throws -> FileOperation {
+        let rootComponents = SafetyValidator.destinationRootComponents(
+            source: operation.sourceURL,
+            settings: operation.settings
+        )
+        let pauseState = self.pauseState
+        var targets: [FanOutDestinationTarget] = []
+
+        for (destinationIndex, destinationURL) in operation.destinationURLs.enumerated() {
+            do {
+                _ = try SafetyValidator.resolvedDestinationRootChecked(
+                    source: operation.sourceURL,
+                    destination: destinationURL,
+                    settings: operation.settings
+                )
+                try Task.checkCancellation()
+                try destinationSetupHook?(destinationURL)
+                let pinned = try PinnedDestinationDirectory.open(
+                    destination: destinationURL,
+                    rootComponents: rootComponents
+                )
+                try FileCopyService.prepareFanOutDirectoryTree(
+                    from: operation.sourceURL,
+                    in: pinned
+                )
+                targets.append(FanOutDestinationTarget(index: destinationIndex, root: pinned))
+            } catch let error as FileOperationError {
+                throw error
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                let fallbackRoot = SafetyValidator.resolvedDestinationRoot(
+                    source: operation.sourceURL,
+                    destination: destinationURL,
+                    settings: operation.settings
+                )
+                for entry in sourceManifest {
+                    let result = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: fallbackRoot.appendingPathComponent(entry.relativePath),
+                        success: false,
+                        error: error,
+                        fileSize: 0,
+                        verificationResult: nil,
+                        processingTime: 0
+                    )
+                    _ = await progressState.recordCopyError()
+                    await destinationProgress.increment(destIndex: destinationIndex)
+                    await resultStore.upsert(result)
+                    await onFileResult?(result)
+                }
+            }
+        }
+
+        for entry in sourceManifest {
+            try Task.checkCancellation()
+            try await waitIfPaused()
+            guard !targets.isEmpty else { break }
+
+            let copied: FanOutFileCopyResult
+            do {
+                copied = try await FileCopyService.copyFileFanOut(
+                    from: entry.url,
+                    relativePath: entry.relativePath,
+                    to: targets,
+                    durabilityIO: durabilityIO,
+                    durabilityRecorder: durabilityRecorder,
+                    pauseCheck: { try await pauseState.waitIfPaused() }
+                )
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                for target in targets {
+                    let failure = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: target.root.destinationURL(for: entry.relativePath),
+                        success: false,
+                        error: error,
+                        fileSize: 0,
+                        verificationResult: nil,
+                        processingTime: 0
+                    )
+                    _ = await progressState.recordCopyError()
+                    await destinationProgress.increment(destIndex: target.index)
+                    await resultStore.upsert(failure)
+                    await onFileResult?(failure)
+                }
+                continue
+            }
+
+            for target in targets {
+                guard let destinationCopy = copied.destinations.first(where: {
+                    $0.destinationIndex == target.index
+                }) else { continue }
+                let destinationURL = destinationCopy.destinationURL
+                let copyUpdate: ProgressState.CopyUpdate
+                if destinationCopy.success {
+                    copyUpdate = await progressState.recordCopy(
+                        fileSize: entry.size,
+                        totalFiles: totalFiles,
+                        now: Date(),
+                        throttleInterval: 0.5
+                    )
+                } else {
+                    let snapshot = await progressState.recordCopyError()
+                    copyUpdate = ProgressState.CopyUpdate(
+                        processedFiles: snapshot.processedFiles,
+                        totalBytesProcessed: snapshot.totalBytesProcessed,
+                        shouldEmitProgress: false,
+                        shouldLog: false
+                    )
+                }
+                await destinationProgress.increment(destIndex: target.index)
+
+                guard destinationCopy.success else {
+                    let failure = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: destinationURL,
+                        success: false,
+                        error: destinationCopy.error,
+                        fileSize: 0,
+                        verificationResult: nil,
+                        processingTime: 0
+                    )
+                    await resultStore.upsert(failure)
+                    await onFileResult?(failure)
+                    continue
+                }
+
+                let copiedResult = FileOperationResult(
+                    sourceURL: entry.url,
+                    destinationURL: destinationURL,
+                    success: true,
+                    error: nil,
+                    fileSize: entry.size,
+                    verificationResult: nil,
+                    processingTime: 0
+                )
+                await resultStore.upsert(copiedResult)
+                await onFileResult?(copiedResult)
+
+                let verificationStart = Date()
+                do {
+                    let verification = try await FileCopyService.verifyPinnedDestinationFile(
+                        referenceSHA256: copied.sourceSHA256,
+                        expectedSize: entry.size,
+                        source: entry.url,
+                        sourceIdentity: copied.sourceIdentity,
+                        pinnedRoot: target.root,
+                        relativePath: entry.relativePath,
+                        durabilityIO: durabilityIO,
+                        durabilityRecorder: durabilityRecorder
+                    )
+                    let result = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: destinationURL,
+                        success: verification.matches,
+                        error: nil,
+                        fileSize: entry.size,
+                        verificationResult: verification,
+                        processingTime: Date().timeIntervalSince(verificationStart)
+                    )
+                    _ = await verifyCounter.increment()
+                    await resultStore.upsert(result)
+                    await onFileResult?(result)
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    let failure = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: destinationURL,
+                        success: false,
+                        error: error,
+                        fileSize: 0,
+                        verificationResult: nil,
+                        processingTime: Date().timeIntervalSince(verificationStart)
+                    )
+                    _ = await verifyCounter.increment()
+                    await resultStore.upsert(failure)
+                    await onFileResult?(failure)
+                }
+
+                if copyUpdate.shouldEmitProgress {
+                    let elapsed = Date().timeIntervalSince(startTime)
+                    let speed = elapsed > 0 ? Double(copyUpdate.totalBytesProcessed) / elapsed : nil
+                    let snapshot = await destinationProgress.snapshot()
+                    progressCallback(OperationProgress(
+                        overallProgress: Double(copyUpdate.processedFiles) / Double(max(1, totalFiles * totalStageUnits)),
+                        currentFile: entry.relativePath,
+                        filesProcessed: copyUpdate.processedFiles,
+                        totalFiles: totalFiles,
+                        currentStage: .copying,
+                        speed: speed,
+                        timeRemaining: nil,
+                        elapsedTime: elapsed,
+                        averageSpeed: speed,
+                        peakSpeed: nil,
+                        bytesProcessed: copyUpdate.totalBytesProcessed,
+                        totalBytes: operation.estimatedTotalBytes,
+                        stageProgress: nil,
+                        reusedCopies: nil,
+                        perDestinationTotals: snapshot.totals,
+                        perDestinationCompleted: snapshot.completed
+                    ))
+                }
+            }
+        }
+
+        let finalMetrics = await progressState.snapshot()
+        progressCallback(OperationProgress(
+            overallProgress: 1,
+            currentFile: nil,
+            filesProcessed: totalFiles,
+            totalFiles: totalFiles,
+            currentStage: .completed,
+            speed: nil,
+            timeRemaining: 0,
+            elapsedTime: Date().timeIntervalSince(startTime),
+            averageSpeed: nil,
+            peakSpeed: nil,
+            bytesProcessed: finalMetrics.totalBytesProcessed,
+            totalBytes: operation.estimatedTotalBytes,
+            stageProgress: 1
+        ))
+
+        return FileOperation(
+            sourceURL: operation.sourceURL,
+            destinationURLs: operation.destinationURLs,
+            startTime: operation.startTime,
+            endTime: Date(),
+            results: await resultStore.snapshot(),
+            verificationMode: operation.verificationMode,
+            settings: operation.settings,
+            estimatedTotalBytes: operation.estimatedTotalBytes
+        )
+    }
+    #endif
 }
