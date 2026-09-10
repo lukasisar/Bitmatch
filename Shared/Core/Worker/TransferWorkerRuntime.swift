@@ -141,12 +141,164 @@ private struct SourceAttemptFileSnapshot: Equatable {
     let modificationNanoseconds: Int
 }
 
+struct WorkerExpectedResultFile: Equatable, Sendable {
+    let relativePath: String
+    let size: Int64
+}
+
+struct WorkerResultObservation: Equatable, Sendable {
+    let relativePath: String?
+    let destinationRequestID: String?
+    let success: Bool
+    let fileSize: Int64
+}
+
+struct WorkerResultPair: Hashable, Sendable {
+    let relativePath: String
+    let destinationRequestID: String
+}
+
+struct WorkerResultSetValidation: Sendable {
+    let errors: [WorkerTypedError]
+    private let resultIndexesByPair: [WorkerResultPair: [Int]]
+
+    var isExact: Bool { errors.isEmpty }
+
+    func uniqueResultIndex(relativePath: String, destinationRequestID: String) -> Int? {
+        let indexes = resultIndexesByPair[WorkerResultPair(
+            relativePath: relativePath,
+            destinationRequestID: destinationRequestID
+        )]
+        guard indexes?.count == 1 else { return nil }
+        return indexes?.first
+    }
+
+    func verificationOutcome(
+        candidate: WorkerVerificationOutcome,
+        sourceStableAcrossAttempt: Bool
+    ) -> WorkerVerificationOutcome {
+        isExact && sourceStableAcrossAttempt ? candidate : .failed
+    }
+
+    fileprivate init(errors: [WorkerTypedError], resultIndexesByPair: [WorkerResultPair: [Int]]) {
+        self.errors = errors
+        self.resultIndexesByPair = resultIndexesByPair
+    }
+}
+
+enum WorkerResultSetValidator {
+    static func validate(
+        expectedFiles: [WorkerExpectedResultFile],
+        destinationRequestIDs: [String],
+        observations: [WorkerResultObservation]
+    ) -> WorkerResultSetValidation {
+        var expectedByPath: [String: WorkerExpectedResultFile] = [:]
+        var errors: [WorkerTypedError] = []
+        for expected in expectedFiles {
+            if expectedByPath.updateValue(expected, forKey: expected.relativePath) != nil {
+                errors.append(WorkerTypedError(
+                    code: "result-set-duplicate",
+                    message: "Frozen source manifest contains a duplicate relative path",
+                    relativePath: expected.relativePath
+                ))
+            }
+        }
+        let destinationIDs = Set(destinationRequestIDs)
+        let expectedPairs = Set(destinationRequestIDs.flatMap { destinationID in
+            expectedByPath.values.map {
+                WorkerResultPair(relativePath: $0.relativePath, destinationRequestID: destinationID)
+            }
+        })
+        var indexesByPair: [WorkerResultPair: [Int]] = [:]
+
+        for (index, observation) in observations.enumerated() {
+            guard let relativePath = observation.relativePath,
+                  expectedByPath[relativePath] != nil,
+                  let destinationID = observation.destinationRequestID,
+                  destinationIDs.contains(destinationID) else {
+                errors.append(WorkerTypedError(
+                    code: "result-set-unexpected",
+                    message: unexpectedMessage(for: observation),
+                    destinationRequestID: observation.destinationRequestID,
+                    relativePath: observation.relativePath
+                ))
+                continue
+            }
+            let pair = WorkerResultPair(relativePath: relativePath, destinationRequestID: destinationID)
+            guard expectedPairs.contains(pair) else {
+                errors.append(WorkerTypedError(
+                    code: "result-set-unexpected",
+                    message: "Result does not belong to the frozen source/destination plan",
+                    destinationRequestID: destinationID,
+                    relativePath: relativePath
+                ))
+                continue
+            }
+            indexesByPair[pair, default: []].append(index)
+        }
+
+        for pair in expectedPairs.sorted(by: pairSort) {
+            let indexes = indexesByPair[pair] ?? []
+            if indexes.isEmpty {
+                errors.append(WorkerTypedError(
+                    code: "result-set-incomplete",
+                    message: "Missing result for expected source/destination pair",
+                    destinationRequestID: pair.destinationRequestID,
+                    relativePath: pair.relativePath
+                ))
+            } else if indexes.count > 1 {
+                errors.append(WorkerTypedError(
+                    code: "result-set-duplicate",
+                    message: "Expected exactly one result for source/destination pair; received \(indexes.count)",
+                    destinationRequestID: pair.destinationRequestID,
+                    relativePath: pair.relativePath
+                ))
+            } else if let expected = expectedByPath[pair.relativePath],
+                      observations[indexes[0]].success,
+                      observations[indexes[0]].fileSize != expected.size {
+                errors.append(WorkerTypedError(
+                    code: "result-set-inconsistent",
+                    message: "Successful result reported \(observations[indexes[0]].fileSize) bytes; expected \(expected.size)",
+                    destinationRequestID: pair.destinationRequestID,
+                    relativePath: pair.relativePath
+                ))
+            }
+        }
+
+        errors.sort(by: errorSort)
+        return WorkerResultSetValidation(errors: errors, resultIndexesByPair: indexesByPair)
+    }
+
+    private static func pairSort(_ left: WorkerResultPair, _ right: WorkerResultPair) -> Bool {
+        if left.destinationRequestID != right.destinationRequestID {
+            return left.destinationRequestID < right.destinationRequestID
+        }
+        return left.relativePath < right.relativePath
+    }
+
+    private static func errorSort(_ left: WorkerTypedError, _ right: WorkerTypedError) -> Bool {
+        let leftKey = [left.code, left.destinationRequestID ?? "", left.relativePath ?? "", left.message]
+        let rightKey = [right.code, right.destinationRequestID ?? "", right.relativePath ?? "", right.message]
+        return leftKey.lexicographicallyPrecedes(rightKey)
+    }
+
+    private static func unexpectedMessage(for observation: WorkerResultObservation) -> String {
+        switch (observation.relativePath, observation.destinationRequestID) {
+        case (nil, nil): return "Result references an unexpected source and destination"
+        case (nil, _): return "Result references an unexpected source"
+        case (_, nil): return "Result references an unexpected destination"
+        case (_, _): return "Result does not belong to the frozen source/destination plan"
+        }
+    }
+}
+
 public struct TransferWorkerRuntime {
     public static let supportedCapabilities = [
         "atomic-no-overwrite",
         "bounded-detail-evidence",
         "darwin-full-fsync-facts",
         "directory-publication-flush",
+        "exact-result-set-validation",
         "full-destination-readback",
         "os-cache-bypass-request",
         "sha256-verification",
@@ -285,27 +437,52 @@ public struct TransferWorkerRuntime {
                     sourceAttemptSnapshot,
                     sourceURL: sourceURL
                 )
+                let expectedFiles = manifest.map {
+                    WorkerExpectedResultFile(relativePath: $0.relativePath, size: $0.size)
+                }
+                let sourceResolver = RelativePathResolver(base: sourceURL)
+                let resultSetValidation = WorkerResultSetValidator.validate(
+                    expectedFiles: expectedFiles,
+                    destinationRequestIDs: job.destinations.map(\.requestID),
+                    observations: operation.results.map { result in
+                        WorkerResultObservation(
+                            relativePath: try? sourceResolver.resolve(result.sourceURL),
+                            destinationRequestID: destinationRequestID(
+                                for: result.destinationURL,
+                                destinations: job.destinations
+                            ),
+                            success: result.success,
+                            fileSize: result.fileSize
+                        )
+                    }
+                )
                 summaries = makeDestinationSummaries(
                     operation: operation,
                     job: job,
-                    sourceURL: sourceURL,
+                    expectedFiles: expectedFiles,
+                    resultSetValidation: resultSetValidation,
                     facts: durabilityFacts,
                     sourceStableAcrossAttempt: sourceStableAcrossAttempt
                 )
                 sourceSummary = makeSourceSummary(
                     sourceSummary,
                     operation: operation,
+                    expectedFiles: expectedFiles,
+                    destinationRequestIDs: job.destinations.map(\.requestID),
+                    resultSetValidation: resultSetValidation,
                     facts: durabilityFacts,
                     sourceStableAcrossAttempt: sourceStableAcrossAttempt
                 )
                 var errors = makeErrors(operation: operation, job: job, sourceURL: sourceURL)
+                errors.append(contentsOf: resultSetValidation.errors)
                 if !sourceStableAcrossAttempt {
                     errors.append(WorkerTypedError(code: "source-mutated", message: "Source manifest changed during the transfer attempt"))
                 }
                 let detailReference = try await writer.publish()
-                let outcome = sourceStableAcrossAttempt
-                    ? aggregateOutcome(operation: operation, facts: durabilityFacts)
-                    : .failed
+                let outcome = resultSetValidation.verificationOutcome(
+                    candidate: aggregate(summaries.map(\.verificationOutcome)),
+                    sourceStableAcrossAttempt: sourceStableAcrossAttempt
+                )
                 if outcome == .failed && errors.isEmpty {
                     errors.append(WorkerTypedError(
                         code: "verification-facts-incomplete",
@@ -551,27 +728,38 @@ public struct TransferWorkerRuntime {
     private func makeDestinationSummaries(
         operation: FileOperation,
         job: TransferJobSpec,
-        sourceURL: URL,
+        expectedFiles: [WorkerExpectedResultFile],
+        resultSetValidation: WorkerResultSetValidation,
         facts: WorkerDurabilityFactsCollector,
         sourceStableAcrossAttempt: Bool
     ) -> [DestinationEvidenceSummary] {
         job.destinations.map { destination in
-            let matching = operation.results.filter {
-                destinationRequestID(for: $0.destinationURL, destinations: job.destinations) == destination.requestID
-            }
-            let outcomes = matching.map { result in
-                sourceStableAcrossAttempt
+            let outcomesAndBytes = expectedFiles.map { expected -> (WorkerVerificationOutcome, Int64) in
+                guard let index = resultSetValidation.uniqueResultIndex(
+                    relativePath: expected.relativePath,
+                    destinationRequestID: destination.requestID
+                ) else { return (.failed, 0) }
+                let result = operation.results[index]
+                guard result.fileSize == expected.size else { return (.failed, 0) }
+                let outcome = sourceStableAcrossAttempt
                     ? fileOutcome(result: result, facts: facts.snapshot(destinationPath: result.destinationURL.path))
                     : .failed
+                return (outcome, outcome == .failed ? 0 : expected.size)
             }
+            let outcomes = outcomesAndBytes.map(\.0)
+            let successfulFiles = outcomes.filter { $0 != .failed }.count
+            let candidate = aggregate(outcomes)
             return DestinationEvidenceSummary(
                 requestID: destination.requestID,
                 executionRoot: destination.executionRoot,
                 role: destination.role,
-                successfulFiles: matching.filter(\.success).count,
-                failedFiles: matching.filter { !$0.success }.count,
-                verifiedBytes: matching.filter(\.success).reduce(0) { $0 + $1.fileSize },
-                verificationOutcome: aggregate(outcomes),
+                successfulFiles: successfulFiles,
+                failedFiles: expectedFiles.count - successfulFiles,
+                verifiedBytes: outcomesAndBytes.reduce(0) { $0 + $1.1 },
+                verificationOutcome: resultSetValidation.verificationOutcome(
+                    candidate: candidate,
+                    sourceStableAcrossAttempt: sourceStableAcrossAttempt
+                ),
                 strongFiles: outcomes.filter { $0 == .verifiedStrong }.count,
                 degradedFiles: outcomes.filter { $0 == .verifiedDegraded }.count
             )
@@ -581,6 +769,9 @@ public struct TransferWorkerRuntime {
     private func makeSourceSummary(
         _ base: SourceEvidenceSummary,
         operation: FileOperation,
+        expectedFiles: [WorkerExpectedResultFile],
+        destinationRequestIDs: [String],
+        resultSetValidation: WorkerResultSetValidation,
         facts: WorkerDurabilityFactsCollector,
         sourceStableAcrossAttempt: Bool
     ) -> SourceEvidenceSummary {
@@ -593,9 +784,13 @@ public struct TransferWorkerRuntime {
                 stabilityFailedFiles: base.fileCount
             )
         }
-        let grouped = Dictionary(grouping: operation.results, by: { $0.sourceURL.path })
-        let stable = grouped.values.filter { results in
-            !results.isEmpty && results.allSatisfy { result in
+        let stable = expectedFiles.filter { expected in
+            destinationRequestIDs.allSatisfy { destinationID in
+                guard let index = resultSetValidation.uniqueResultIndex(
+                    relativePath: expected.relativePath,
+                    destinationRequestID: destinationID
+                ) else { return false }
+                let result = operation.results[index]
                 let snapshot = facts.snapshot(destinationPath: result.destinationURL.path)
                 return snapshot.copy?.sourceRemainedStable == true
                     && snapshot.readback?.sourceRemainedStable == true
@@ -635,15 +830,6 @@ public struct TransferWorkerRuntime {
         guard let finalManifest = try? FileTreeEnumerator.enumerateRegularFiles(base: sourceURL),
               let final = try? captureSourceAttemptSnapshot(finalManifest) else { return false }
         return initial == final
-    }
-
-    private func aggregateOutcome(
-        operation: FileOperation,
-        facts: WorkerDurabilityFactsCollector
-    ) -> WorkerVerificationOutcome {
-        aggregate(operation.results.map {
-            fileOutcome(result: $0, facts: facts.snapshot(destinationPath: $0.destinationURL.path))
-        })
     }
 
     private func aggregate(_ outcomes: [WorkerVerificationOutcome]) -> WorkerVerificationOutcome {

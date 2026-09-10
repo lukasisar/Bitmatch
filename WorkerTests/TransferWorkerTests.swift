@@ -14,6 +14,7 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     var corruptReadback = false
     var publicationHook: ((String) throws -> Void)?
     var sourceVerificationHook: ((String) throws -> Void)?
+    var fullSyncObserver: ((Int32) -> Void)?
     private let lock = NSLock()
     private var readCallsStorage = 0
 
@@ -23,7 +24,10 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
         return readCallsStorage
     }
 
-    func fullSync(fileDescriptor: Int32) -> TransferSystemCallOutcome { fullSyncOutcome }
+    func fullSync(fileDescriptor: Int32) -> TransferSystemCallOutcome {
+        fullSyncObserver?(fileDescriptor)
+        return fullSyncOutcome
+    }
     func syncDirectory(fileDescriptor: Int32) -> TransferSystemCallOutcome { directorySyncOutcome }
     func requestCacheBypass(fileDescriptor: Int32) -> TransferSystemCallOutcome { cacheBypassOutcome }
     func prepareForPublication(destinationPath: String) throws { try publicationHook?(destinationPath) }
@@ -113,6 +117,102 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(runtime.capabilities().supportedProtocolVersions, [2])
         XCTAssertEqual(runtime.capabilities().supportedVerificationPolicies, ["sha256"])
         XCTAssertEqual(runtime.capabilities().upstreamRevision, TransferWorkerIdentity.upstreamRevision)
+    }
+
+    func testExactResultSetValidatorAcceptsCompleteCartesianProduct() {
+        let validation = validateResultSet(completeResultObservations())
+
+        XCTAssertTrue(validation.isExact)
+        XCTAssertTrue(validation.errors.isEmpty)
+        XCTAssertEqual(
+            validation.verificationOutcome(candidate: .verifiedStrong, sourceStableAcrossAttempt: true),
+            .verifiedStrong
+        )
+        XCTAssertEqual(
+            validation.verificationOutcome(candidate: .verifiedDegraded, sourceStableAcrossAttempt: true),
+            .verifiedDegraded
+        )
+    }
+
+    func testResultSetValidatorRejectsOneMissingPairAndFailsClosed() {
+        var observations = completeResultObservations()
+        observations.removeLast()
+        let validation = validateResultSet(observations)
+
+        XCTAssertEqual(validation.errors.map(\.code), ["result-set-incomplete"])
+        XCTAssertEqual(
+            validation.verificationOutcome(candidate: .verifiedStrong, sourceStableAcrossAttempt: true),
+            .failed
+        )
+        XCTAssertEqual(
+            validation.verificationOutcome(candidate: .verifiedDegraded, sourceStableAcrossAttempt: true),
+            .failed
+        )
+    }
+
+    func testResultSetValidatorRejectsDuplicatePair() {
+        var observations = completeResultObservations()
+        observations.append(observations[0])
+        let validation = validateResultSet(observations)
+
+        XCTAssertEqual(validation.errors.map(\.code), ["result-set-duplicate"])
+        XCTAssertEqual(
+            validation.verificationOutcome(candidate: .verifiedStrong, sourceStableAcrossAttempt: true),
+            .failed
+        )
+    }
+
+    func testResultSetValidatorRejectsUnexpectedSourceAndDestinationPairs() {
+        var unexpectedSource = completeResultObservations()
+        unexpectedSource.append(WorkerResultObservation(
+            relativePath: "unexpected.mov",
+            destinationRequestID: "destination-a",
+            success: true,
+            fileSize: 30
+        ))
+        var unexpectedDestination = completeResultObservations()
+        unexpectedDestination.append(WorkerResultObservation(
+            relativePath: "a.mov",
+            destinationRequestID: "destination-c",
+            success: true,
+            fileSize: 10
+        ))
+
+        for validation in [validateResultSet(unexpectedSource), validateResultSet(unexpectedDestination)] {
+            XCTAssertEqual(validation.errors.map(\.code), ["result-set-unexpected"])
+            XCTAssertEqual(
+                validation.verificationOutcome(candidate: .verifiedDegraded, sourceStableAcrossAttempt: true),
+                .failed
+            )
+        }
+    }
+
+    func testResultSetValidatorRejectsOmittedDestination() {
+        let observations = completeResultObservations().filter {
+            $0.destinationRequestID == "destination-a"
+        }
+        let validation = validateResultSet(observations)
+
+        XCTAssertFalse(validation.isExact)
+        XCTAssertEqual(validation.errors.map(\.code), ["result-set-incomplete", "result-set-incomplete"])
+        XCTAssertTrue(validation.errors.allSatisfy { $0.destinationRequestID == "destination-b" })
+    }
+
+    func testResultSetValidatorRejectsSuccessfulByteCountMismatch() {
+        var observations = completeResultObservations()
+        observations[0] = WorkerResultObservation(
+            relativePath: observations[0].relativePath,
+            destinationRequestID: observations[0].destinationRequestID,
+            success: true,
+            fileSize: 9
+        )
+        let validation = validateResultSet(observations)
+
+        XCTAssertEqual(validation.errors.map(\.code), ["result-set-inconsistent"])
+        XCTAssertEqual(
+            validation.verificationOutcome(candidate: .verifiedStrong, sourceStableAcrossAttempt: true),
+            .failed
+        )
     }
 
     func testUnsupportedProtocolAndMandatoryCapabilityFailBeforeDestinationWrites() async throws {
@@ -219,6 +319,14 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedStrong)
         XCTAssertEqual(result.evidence?.source.stabilityVerifiedFiles, 2)
         XCTAssertTrue(result.evidence?.destinations.allSatisfy { $0.verificationOutcome == .verifiedStrong } == true)
+        let expectedBytes = try XCTUnwrap(result.evidence).source.totalBytes
+        XCTAssertTrue(result.evidence?.destinations.allSatisfy {
+            $0.successfulFiles == 2
+                && $0.failedFiles == 0
+                && $0.verifiedBytes == expectedBytes
+                && $0.strongFiles == 2
+                && $0.degradedFiles == 0
+        } == true)
 
         let decoded = try TransferWorkerRuntime.makeDecoder().decode(
             TransferEvidence.self,
@@ -321,6 +429,35 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "full-sync-failed" } == true)
     }
 
+    func testFullSyncObservesPreservedModificationTime() async throws {
+        let expectedDate = Date(timeIntervalSince1970: 1_700_000_000)
+        for filename in ["camera-like-file-1.bin", "camera-like-file-2.bin"] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: expectedDate],
+                ofItemAtPath: source.appendingPathComponent(filename).path
+            )
+        }
+        let io = FaultingDurabilityIO()
+        let lock = NSLock()
+        var observedSeconds: [Int] = []
+        io.fullSyncObserver = { descriptor in
+            var info = stat()
+            guard fstat(descriptor, &info) == 0 else { return }
+            lock.lock()
+            observedSeconds.append(info.st_mtimespec.tv_sec)
+            lock.unlock()
+        }
+
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)]),
+            evidenceURL: root.appendingPathComponent("mtime-before-full-sync.json")
+        )
+
+        XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedStrong)
+        XCTAssertEqual(observedSeconds.count, 2)
+        XCTAssertTrue(observedSeconds.allSatisfy { $0 == Int(expectedDate.timeIntervalSince1970) })
+    }
+
     func testUnsupportedFullSyncIsExplicitlyDegraded() async throws {
         let io = FaultingDurabilityIO()
         io.fullSyncOutcome = .unsupported(code: ENOTSUP, message: "simulated unsupported full sync")
@@ -333,6 +470,12 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedDegraded)
         XCTAssertTrue(result.evidence?.warnings.contains { $0.contains("F_FULLFSYNC") } == true)
         XCTAssertTrue(try detailRecords(from: result).allSatisfy { $0.durabilityFlush.status == .unsupported })
+        let summary = try XCTUnwrap(result.evidence?.destinations.first)
+        XCTAssertEqual(summary.successfulFiles, 2)
+        XCTAssertEqual(summary.failedFiles, 0)
+        XCTAssertEqual(summary.verifiedBytes, try XCTUnwrap(result.evidence).source.totalBytes)
+        XCTAssertEqual(summary.strongFiles, 0)
+        XCTAssertEqual(summary.degradedFiles, 2)
     }
 
     func testDirectorySyncFailureRollsBackPublishedFile() async throws {
@@ -472,6 +615,26 @@ final class TransferWorkerTests: XCTestCase {
             verificationPolicy: .sha256,
             requestedCapabilities: requestedCapabilities
         )
+    }
+
+    private func validateResultSet(_ observations: [WorkerResultObservation]) -> WorkerResultSetValidation {
+        WorkerResultSetValidator.validate(
+            expectedFiles: [
+                WorkerExpectedResultFile(relativePath: "a.mov", size: 10),
+                WorkerExpectedResultFile(relativePath: "b.mov", size: 20),
+            ],
+            destinationRequestIDs: ["destination-a", "destination-b"],
+            observations: observations
+        )
+    }
+
+    private func completeResultObservations() -> [WorkerResultObservation] {
+        [
+            WorkerResultObservation(relativePath: "a.mov", destinationRequestID: "destination-a", success: true, fileSize: 10),
+            WorkerResultObservation(relativePath: "b.mov", destinationRequestID: "destination-a", success: true, fileSize: 20),
+            WorkerResultObservation(relativePath: "a.mov", destinationRequestID: "destination-b", success: true, fileSize: 10),
+            WorkerResultObservation(relativePath: "b.mov", destinationRequestID: "destination-b", success: true, fileSize: 20),
+        ]
     }
 
     private func assertDestinationHasNoOutput(_ destination: URL) throws {

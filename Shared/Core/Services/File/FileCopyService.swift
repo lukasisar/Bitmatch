@@ -890,6 +890,17 @@ final class FileCopyService {
                 if durabilityIO != nil { copiedSourceHasher.update(data: data) }
             }
         }
+
+        // Preserve the requested final-file metadata before synchronization so
+        // the ordinary flush and F_FULLFSYNC facts describe the exact temp-file
+        // state that will be published, including its modification time.
+        if let sourceModificationDate {
+            var times = [timespec(tv_sec: Int(sourceModificationDate.timeIntervalSince1970), tv_nsec: 0),
+                         timespec(tv_sec: Int(sourceModificationDate.timeIntervalSince1970), tv_nsec: 0)]
+            if futimens(temporaryFD, &times) != 0 {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to preserve destination modification date"])
+            }
+        }
         #if compiler(>=5.7)
         if #available(iOS 16.0, macOS 13.0, *) {
             try destinationHandle.synchronize()
@@ -901,14 +912,10 @@ final class FileCopyService {
         #endif
 
         var durabilityFacts = TransferCopyDurabilityFacts(ordinaryFlushSucceeded: true)
-        if let durabilityIO {
-            let fullSync = durabilityIO.fullSync(fileDescriptor: temporaryFD)
-            durabilityFacts.fullSync = fullSync
+        if durabilityIO != nil {
             durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
-            if case .failed = fullSync {
-                throw TransferDurabilityError.syscall("F_FULLFSYNC", outcome: fullSync)
-            }
-
+        }
+        if durabilityIO != nil {
             guard Darwin.lseek(temporaryFD, 0, SEEK_SET) == 0 else {
                 throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to seek temporary destination for pre-publication verification"])
             }
@@ -932,25 +939,33 @@ final class FileCopyService {
             durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
         }
 
-        var temporaryInfo = stat()
-        guard fstat(temporaryFD, &temporaryInfo) == 0,
-              Int64(temporaryInfo.st_size) == sourceSize else {
-            throw NSError(domain: "FileCopyService", code: -2, userInfo: [NSLocalizedDescriptionKey: "Size mismatch after copy"])
-        }
         var sourceFinal = stat()
         guard fstat(sourceFD, &sourceFinal) == 0,
               pinnedFileRemainedStable(sourceInitial, sourceFinal) else {
             throw NSError(domain: "FileCopyService", code: -4, userInfo: [NSLocalizedDescriptionKey: "Source file changed during copy; destination was not modified"])
         }
         durabilityFacts.sourceRemainedStable = true
+        durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
 
-        if let sourceModificationDate {
-            var times = [timespec(tv_sec: Int(sourceModificationDate.timeIntervalSince1970), tv_nsec: 0),
-                         timespec(tv_sec: Int(sourceModificationDate.timeIntervalSince1970), tv_nsec: 0)]
-            if futimens(temporaryFD, &times) != 0 {
-                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: "Unable to preserve destination modification date"])
+        if let durabilityIO {
+            // This stronger request follows all file-data and preserved-mtime
+            // mutations, so its fact applies to the exact inode state that is
+            // about to be published. It is still not proof of physical-media
+            // persistence across the complete storage stack.
+            let fullSync = durabilityIO.fullSync(fileDescriptor: temporaryFD)
+            durabilityFacts.fullSync = fullSync
+            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+            if case .failed = fullSync {
+                throw TransferDurabilityError.syscall("F_FULLFSYNC", outcome: fullSync)
             }
         }
+
+        var temporaryInfo = stat()
+        guard fstat(temporaryFD, &temporaryInfo) == 0,
+              Int64(temporaryInfo.st_size) == sourceSize else {
+            throw NSError(domain: "FileCopyService", code: -2, userInfo: [NSLocalizedDescriptionKey: "Size mismatch after copy"])
+        }
+
         try durabilityIO?.prepareForPublication(destinationPath: destinationPath)
         try PinnedDestinationDirectory.publishTemporaryFile(named: temporaryName, as: filename, relativeTo: parentFD)
         durabilityFacts.publicationSucceeded = true
