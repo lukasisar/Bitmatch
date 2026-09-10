@@ -481,6 +481,7 @@ extension FileCopyService {
         var temporaryHasher = SHA256()
         var verifiedBytes: Int64 = 0
         while verifiedBytes < sourceSize {
+            try Task.checkCancellation()
             let data = try fanOutReadDescriptor(
                 writer.temporaryFD,
                 maximumCount: Int(min(Int64(1024 * 1024), sourceSize - verifiedBytes))
