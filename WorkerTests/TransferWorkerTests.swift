@@ -724,7 +724,9 @@ final class TransferWorkerTests: XCTestCase {
         ))
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "directory-flush-failed" } == true)
         XCTAssertTrue(try detailRecords(from: result).contains {
-            $0.verificationOutcome == .failed && $0.publication == .published
+            $0.verificationOutcome == .failed
+                && $0.publication == .published
+                && $0.publicationInterrupted == true
         })
     }
 

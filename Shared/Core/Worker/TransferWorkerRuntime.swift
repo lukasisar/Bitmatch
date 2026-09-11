@@ -1079,6 +1079,7 @@ private func makeFileEvidence(
         cacheBypass: operationFact(readback.cacheBypass),
         durabilityFlush: operationFact(copy.fullSync),
         directoryMetadataFlush: operationFact(copy.directorySync),
+        publicationInterrupted: copy.publicationInterrupted,
         publication: copy.reusedExistingDestination
             ? .reusedExisting
             : copy.publicationSucceeded ? .published : .notPublished,

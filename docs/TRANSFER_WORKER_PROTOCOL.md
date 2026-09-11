@@ -240,9 +240,9 @@ Detailed file results are streamed to `<evidence>.details.jsonl`, not accumulate
 in the final JSON object. The final reference records its format, record count,
 and SHA-256 digest. Every record exposes the source and destination SHA-256
 digests when available, attempt-wide/read-time source stability facts,
-pre-publication checksum result, publication disposition, complete-readback
-byte count, and separate outcomes for `F_FULLFSYNC`, directory `fsync`, and
-`F_NOCACHE`.
+pre-publication checksum result, publication disposition, an explicit
+`publicationInterrupted` fact, complete-readback byte count, and separate
+outcomes for `F_FULLFSYNC`, directory `fsync`, and `F_NOCACHE`.
 
 Both detailed and final artifacts are written under unique `.partial-*` names
 and atomically renamed only when complete. Existing final artifacts are never

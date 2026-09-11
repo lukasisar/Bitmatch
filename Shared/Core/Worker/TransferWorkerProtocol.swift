@@ -350,6 +350,9 @@ struct FileEvidenceRecord: Codable, Equatable, Sendable {
     let cacheBypass: WorkerOperationFact
     let durabilityFlush: WorkerOperationFact
     let directoryMetadataFlush: WorkerOperationFact
+    /// Added compatibly within V3; `nil` is accepted when decoding evidence
+    /// emitted by an earlier V3 worker build.
+    let publicationInterrupted: Bool?
     let publication: WorkerPublicationDisposition
     let error: WorkerTypedError?
 }
