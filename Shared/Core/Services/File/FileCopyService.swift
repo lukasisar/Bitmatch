@@ -410,7 +410,15 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
                 underlying: error
             )
         }
-        let claimedIdentity = PublishedFileIdentity(claimedInfo)
+        // Confirmed on real exFAT hardware (PP-019): macOS's exFAT driver reports a
+        // synthetic, transient inode for a just-created, not-yet-flushed file --
+        // completely different from the real, stable inode it reports once the
+        // directory entry is actually committed (which the ordinary `fsync` below
+        // triggers). Binding identity to this pre-flush snapshot would make every
+        // later identity check against a fresh path lookup fail unconditionally,
+        // not just under a genuine race. It is kept only as a best-effort label for
+        // an `.interrupted` failure that happens before any commit point exists.
+        let preFlushIdentity = PublishedFileIdentity(claimedInfo)
 
         do {
             try durabilityIO.prepareForClaimedPublication(destinationPath: destinationPath)
@@ -428,6 +436,14 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
                 throw posixError("Unable to synchronize final destination file")
             }
 
+            // The stable, post-commit identity: the reference every later check
+            // (including a fresh path-based reopen) must be compared against.
+            var committedInfo = stat()
+            guard fstat(finalFD, &committedInfo) == 0 else {
+                throw posixError("Unable to inspect final destination file after commit")
+            }
+            let stableIdentity = PublishedFileIdentity(committedInfo)
+
             let finalFullSync = durabilityIO.fullSync(fileDescriptor: finalFD)
             if case .failed = finalFullSync {
                 throw TransferDurabilityError.syscall("final destination F_FULLFSYNC", outcome: finalFullSync)
@@ -437,8 +453,8 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
             guard fstat(finalFD, &finalInfo) == 0 else {
                 throw posixError("Unable to inspect final destination file after publication")
             }
-            guard claimedIdentity.matches(finalInfo) else {
-                throw DestinationPublicationFailure.ownershipLost(identity: claimedIdentity)
+            guard stableIdentity.matches(finalInfo) else {
+                throw DestinationPublicationFailure.ownershipLost(identity: stableIdentity)
             }
             guard Int64(finalInfo.st_size) == Int64(temporaryInfo.st_size) else {
                 throw NSError(
@@ -447,18 +463,18 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
                     userInfo: [NSLocalizedDescriptionKey: "Final destination size changed during publication"]
                 )
             }
-            guard nameStillIdentifies(claimedIdentity, named: name, relativeTo: parentFD) else {
-                throw DestinationPublicationFailure.ownershipLost(identity: claimedIdentity)
+            guard nameStillIdentifies(stableIdentity, named: name, relativeTo: parentFD) else {
+                throw DestinationPublicationFailure.ownershipLost(identity: stableIdentity)
             }
 
             removeItem(named: temporaryName, relativeTo: parentFD)
-            return FilePublicationResult(identity: claimedIdentity, finalFullSync: finalFullSync)
+            return FilePublicationResult(identity: stableIdentity, finalFullSync: finalFullSync)
         } catch let failure as DestinationPublicationFailure {
             throw failure
         } catch {
             throw DestinationPublicationFailure.interrupted(
                 "Final destination name was claimed, but publication did not complete",
-                identity: claimedIdentity,
+                identity: preFlushIdentity,
                 underlying: error
             )
         }
