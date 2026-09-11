@@ -17,9 +17,86 @@ struct TransferCopyDurabilityFacts: Equatable, Sendable {
     var prePublicationChecksumMatched = false
     var publicationSucceeded = false
     var publicationRemovedAfterFailure = false
+    var publicationInterrupted = false
+    var publicationIdentity: PublishedFileIdentity?
     var reusedExistingDestination = false
     var directorySync: TransferSystemCallOutcome?
     var sourceRemainedStable = false
+}
+
+/// The filesystem object this attempt actually published. Paths are mutable
+/// directory entries; durable evidence must stay bound to the object claimed by
+/// this attempt rather than trusting whichever object later occupies the name.
+struct PublishedFileIdentity: Equatable, Sendable {
+    let device: UInt64
+    let inode: UInt64
+
+    init(_ info: stat) {
+        device = UInt64(info.st_dev)
+        inode = UInt64(info.st_ino)
+    }
+
+    func matches(_ info: stat) -> Bool {
+        device == UInt64(info.st_dev) && inode == UInt64(info.st_ino)
+    }
+}
+
+struct FilePublicationResult: Equatable, Sendable {
+    let identity: PublishedFileIdentity
+    /// `nil` means the already-flushed temporary inode was published directly.
+    /// A value means a non-linking filesystem required a distinct final inode,
+    /// and this is the durability result for that final inode.
+    let finalFullSync: TransferSystemCallOutcome?
+}
+
+struct DestinationPublicationFailure: Error, CustomNSError, LocalizedError {
+    enum Kind: Int, Sendable {
+        case interrupted = 1
+        case ownershipLost = 2
+    }
+
+    static let errorDomain = "BitMatchTransferWorker.Publication"
+
+    let kind: Kind
+    let message: String
+    let finalNameWasClaimed: Bool
+    let claimedIdentity: PublishedFileIdentity?
+    let underlyingError: Error?
+
+    var errorCode: Int { kind.rawValue }
+    var errorDescription: String? { message }
+    var errorUserInfo: [String: Any] {
+        var info: [String: Any] = [NSLocalizedDescriptionKey: message]
+        if let underlyingError { info[NSUnderlyingErrorKey] = underlyingError }
+        return info
+    }
+
+    static func interrupted(
+        _ message: String,
+        identity: PublishedFileIdentity?,
+        underlying: Error
+    ) -> DestinationPublicationFailure {
+        DestinationPublicationFailure(
+            kind: .interrupted,
+            message: message,
+            finalNameWasClaimed: true,
+            claimedIdentity: identity,
+            underlyingError: underlying
+        )
+    }
+
+    static func ownershipLost(
+        identity: PublishedFileIdentity,
+        finalNameWasClaimed: Bool = true
+    ) -> DestinationPublicationFailure {
+        DestinationPublicationFailure(
+            kind: .ownershipLost,
+            message: "Published destination name no longer identifies the file claimed by this attempt",
+            finalNameWasClaimed: finalNameWasClaimed,
+            claimedIdentity: identity,
+            underlyingError: nil
+        )
+    }
 }
 
 struct TransferReadbackFacts: Equatable, Sendable {
@@ -41,6 +118,7 @@ protocol TransferDurabilityIO: Sendable {
     func requestCacheBypass(fileDescriptor: Int32) -> TransferSystemCallOutcome
     func readDestination(fileDescriptor: Int32, maximumCount: Int) throws -> Data
     func prepareForPublication(destinationPath: String) throws
+    func prepareForClaimedPublication(destinationPath: String) throws
     func prepareForSourceVerification(sourcePath: String) throws
     func prepareForSourceTransfer(sourcePath: String) throws
     func readSource(fileDescriptor: Int32, maximumCount: Int) throws -> Data
@@ -49,6 +127,7 @@ protocol TransferDurabilityIO: Sendable {
 
 extension TransferDurabilityIO {
     func prepareForSourceTransfer(sourcePath: String) throws {}
+    func prepareForClaimedPublication(destinationPath: String) throws {}
 
     func readSource(fileDescriptor: Int32, maximumCount: Int) throws -> Data {
         var buffer = [UInt8](repeating: 0, count: maximumCount)
@@ -193,13 +272,20 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
     /// Opens a destination file below the pinned directory. The returned
     /// descriptor, not `logicalRootURL`, is the authority for subsequent
     /// reads. This is deliberately separate from the display URL above.
-    func openRegularFile(at relativeComponents: [String]) throws -> PinnedDestinationFile {
+    func openRegularFile(
+        at relativeComponents: [String],
+        expectedIdentity: PublishedFileIdentity? = nil
+    ) throws -> PinnedDestinationFile {
         guard let name = relativeComponents.last else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
         }
         let parentFD = try openOrCreateDirectory(at: Array(relativeComponents.dropLast()))
         defer { _ = Darwin.close(parentFD) }
-        return try PinnedDestinationFile.open(named: name, relativeTo: parentFD)
+        return try PinnedDestinationFile.open(
+            named: name,
+            relativeTo: parentFD,
+            expectedIdentity: expectedIdentity
+        )
     }
 
     static func isExistingRegularFile(named name: String, relativeTo parentFD: Int32) throws -> Bool {
@@ -226,31 +312,244 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
         _ = name.withCString { unlinkat(parentFD, $0, 0) }
     }
 
-    /// `linkat` plus removal is an atomic no-replace publication in the same
-    /// pinned directory. Unlike `renameat`, it cannot overwrite a destination
-    /// file that appeared while the copy was in progress.
-    static func publishTemporaryFile(named temporaryName: String, as name: String, relativeTo parentFD: Int32) throws {
-        let status = temporaryName.withCString { temporaryNamePointer in
+    /// Publishes a verified temporary file without ever replacing an existing
+    /// destination name.
+    ///
+    /// Hard-link-capable filesystems retain the original atomic `linkat`
+    /// publication. FAT-family filesystems have no hard links, so only an
+    /// explicit unsupported-operation result selects the descriptor-copy
+    /// fallback. That fallback atomically claims the real final name with
+    /// `O_CREAT | O_EXCL`, copies from the already-open verified temporary
+    /// descriptor into the claimed descriptor, preserves timestamps, and
+    /// flushes the distinct final inode. It deliberately gives up invisible
+    /// atomic publication because exFAT provides no primitive that combines
+    /// that property with no-clobber behavior.
+    ///
+    /// The returned identity must be carried into independent readback. A path
+    /// is mutable and is never proof that the object currently at `name` is the
+    /// object this attempt published.
+    static func publishTemporaryFile(
+        named temporaryName: String,
+        temporaryFileDescriptor temporaryFD: Int32,
+        expectedTemporaryFile temporaryInfo: stat,
+        as name: String,
+        relativeTo parentFD: Int32,
+        destinationPath: String,
+        durabilityIO: any TransferDurabilityIO
+    ) throws -> FilePublicationResult {
+        let linkResult: (status: Int32, error: Int32) = temporaryName.withCString { temporaryNamePointer in
             name.withCString { namePointer in
-                linkat(parentFD, temporaryNamePointer, parentFD, namePointer, 0)
+                let status = linkat(parentFD, temporaryNamePointer, parentFD, namePointer, 0)
+                return (status, status == 0 ? 0 : errno)
             }
         }
-        guard status == 0 else { throw posixError("Destination file appeared during copy; refusing to overwrite it") }
-        removeItem(named: temporaryName, relativeTo: parentFD)
+
+        let temporaryIdentity = PublishedFileIdentity(temporaryInfo)
+        if linkResult.status == 0 {
+            guard nameStillIdentifies(
+                temporaryIdentity,
+                named: name,
+                relativeTo: parentFD
+            ) else {
+                throw DestinationPublicationFailure.ownershipLost(identity: temporaryIdentity)
+            }
+            removeItem(named: temporaryName, relativeTo: parentFD)
+            return FilePublicationResult(identity: temporaryIdentity, finalFullSync: nil)
+        }
+
+        guard linkResult.error == ENOTSUP || linkResult.error == EOPNOTSUPP else {
+            throw posixError(
+                "Destination file appeared during copy; refusing to overwrite it",
+                code: linkResult.error
+            )
+        }
+        return try publishByClaimingNameThenCopying(
+            temporaryName: temporaryName,
+            temporaryFileDescriptor: temporaryFD,
+            expectedTemporaryFile: temporaryInfo,
+            as: name,
+            relativeTo: parentFD,
+            destinationPath: destinationPath,
+            durabilityIO: durabilityIO
+        )
     }
 
-    static func removePublishedFile(
-        named name: String,
+    /// exFAT/FAT fallback. Once the final name is claimed, failures preserve
+    /// both the partial final entry and the verified temporary file. Deleting a
+    /// pathname after an identity check would still be a check/unlink race;
+    /// leaving recoverable evidence is safer than risking deletion of a
+    /// concurrent writer's replacement.
+    static func publishByClaimingNameThenCopying(
+        temporaryName: String,
+        temporaryFileDescriptor temporaryFD: Int32,
+        expectedTemporaryFile temporaryInfo: stat,
+        as name: String,
         relativeTo parentFD: Int32,
-        expected: stat
+        destinationPath: String,
+        durabilityIO: any TransferDurabilityIO
+    ) throws -> FilePublicationResult {
+        let claimFlags = O_CREAT | O_EXCL | O_RDWR | O_NOFOLLOW | O_CLOEXEC
+        let claimResult: (descriptor: Int32, error: Int32) = name.withCString {
+            let descriptor = openat(parentFD, $0, claimFlags, 0o600)
+            return (descriptor, descriptor >= 0 ? 0 : errno)
+        }
+        guard claimResult.descriptor >= 0 else {
+            throw posixError(
+                "Destination file appeared during copy; refusing to overwrite it",
+                code: claimResult.error
+            )
+        }
+        let finalFD = claimResult.descriptor
+        defer { _ = Darwin.close(finalFD) }
+
+        var claimedInfo = stat()
+        guard fstat(finalFD, &claimedInfo) == 0 else {
+            let error = posixError("Unable to inspect newly claimed destination file")
+            throw DestinationPublicationFailure.interrupted(
+                "Final destination name was claimed, but its identity could not be inspected",
+                identity: nil,
+                underlying: error
+            )
+        }
+        let claimedIdentity = PublishedFileIdentity(claimedInfo)
+
+        do {
+            try durabilityIO.prepareForClaimedPublication(destinationPath: destinationPath)
+            try copyVerifiedTemporaryFile(
+                descriptor: temporaryFD,
+                expected: temporaryInfo,
+                into: finalFD
+            )
+
+            var times = [temporaryInfo.st_mtimespec, temporaryInfo.st_mtimespec]
+            guard futimens(finalFD, &times) == 0 else {
+                throw posixError("Unable to preserve final destination modification date")
+            }
+            guard Darwin.fsync(finalFD) == 0 else {
+                throw posixError("Unable to synchronize final destination file")
+            }
+
+            let finalFullSync = durabilityIO.fullSync(fileDescriptor: finalFD)
+            if case .failed = finalFullSync {
+                throw TransferDurabilityError.syscall("final destination F_FULLFSYNC", outcome: finalFullSync)
+            }
+
+            var finalInfo = stat()
+            guard fstat(finalFD, &finalInfo) == 0 else {
+                throw posixError("Unable to inspect final destination file after publication")
+            }
+            guard claimedIdentity.matches(finalInfo) else {
+                throw DestinationPublicationFailure.ownershipLost(identity: claimedIdentity)
+            }
+            guard Int64(finalInfo.st_size) == Int64(temporaryInfo.st_size) else {
+                throw NSError(
+                    domain: "BitMatchTransferWorker.PublicationCopy",
+                    code: 1,
+                    userInfo: [NSLocalizedDescriptionKey: "Final destination size changed during publication"]
+                )
+            }
+            guard nameStillIdentifies(claimedIdentity, named: name, relativeTo: parentFD) else {
+                throw DestinationPublicationFailure.ownershipLost(identity: claimedIdentity)
+            }
+
+            removeItem(named: temporaryName, relativeTo: parentFD)
+            return FilePublicationResult(identity: claimedIdentity, finalFullSync: finalFullSync)
+        } catch let failure as DestinationPublicationFailure {
+            throw failure
+        } catch {
+            throw DestinationPublicationFailure.interrupted(
+                "Final destination name was claimed, but publication did not complete",
+                identity: claimedIdentity,
+                underlying: error
+            )
+        }
+    }
+
+    private static func copyVerifiedTemporaryFile(
+        descriptor temporaryFD: Int32,
+        expected temporaryInfo: stat,
+        into finalFD: Int32
+    ) throws {
+        var before = stat()
+        guard fstat(temporaryFD, &before) == 0,
+              PublishedFileIdentity(temporaryInfo).matches(before),
+              before.st_size == temporaryInfo.st_size,
+              before.st_mtimespec.tv_sec == temporaryInfo.st_mtimespec.tv_sec,
+              before.st_mtimespec.tv_nsec == temporaryInfo.st_mtimespec.tv_nsec else {
+            throw NSError(
+                domain: "BitMatchTransferWorker.VerifiedTemporaryFile",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Verified temporary file changed before publication"]
+            )
+        }
+        guard Darwin.lseek(temporaryFD, 0, SEEK_SET) == 0 else {
+            throw posixError("Unable to seek verified temporary file for publication")
+        }
+
+        var buffer = [UInt8](repeating: 0, count: 1 << 20)
+        while true {
+            let readCount: Int = try retryingInterruptedSystemCall(
+                "Unable to read verified temporary file during publication"
+            ) {
+                buffer.withUnsafeMutableBytes { Darwin.read(temporaryFD, $0.baseAddress, $0.count) }
+            }
+            if readCount == 0 { break }
+
+            var written = 0
+            while written < readCount {
+                let wroteCount: Int = try retryingInterruptedSystemCall(
+                    "Unable to write final destination file during publication"
+                ) {
+                    buffer.withUnsafeBytes { rawBuffer in
+                        Darwin.write(finalFD, rawBuffer.baseAddress!.advanced(by: written), readCount - written)
+                    }
+                }
+                guard wroteCount > 0 else {
+                    throw posixError("Unable to make progress writing final destination file", code: EIO)
+                }
+                written += wroteCount
+            }
+        }
+
+        var after = stat()
+        guard fstat(temporaryFD, &after) == 0,
+              PublishedFileIdentity(temporaryInfo).matches(after),
+              after.st_size == temporaryInfo.st_size,
+              after.st_mtimespec.tv_sec == temporaryInfo.st_mtimespec.tv_sec,
+              after.st_mtimespec.tv_nsec == temporaryInfo.st_mtimespec.tv_nsec else {
+            throw NSError(
+                domain: "BitMatchTransferWorker.VerifiedTemporaryFile",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey: "Verified temporary file changed during publication"]
+            )
+        }
+    }
+
+    private static func nameStillIdentifies(
+        _ expected: PublishedFileIdentity,
+        named name: String,
+        relativeTo parentFD: Int32
     ) -> Bool {
-        var actual = stat()
-        let inspected = name.withCString { fstatat(parentFD, $0, &actual, AT_SYMLINK_NOFOLLOW) }
-        guard inspected == 0,
-              (actual.st_mode & S_IFMT) == S_IFREG,
-              actual.st_dev == expected.st_dev,
-              actual.st_ino == expected.st_ino else { return false }
-        return name.withCString { unlinkat(parentFD, $0, 0) } == 0
+        let descriptor = name.withCString { openat(parentFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard descriptor >= 0 else { return false }
+        defer { _ = Darwin.close(descriptor) }
+        var info = stat()
+        return fstat(descriptor, &info) == 0
+            && (info.st_mode & S_IFMT) == S_IFREG
+            && expected.matches(info)
+    }
+
+    private static func retryingInterruptedSystemCall<T: FixedWidthInteger>(
+        _ message: String,
+        operation: () -> T
+    ) throws -> T {
+        while true {
+            let result = operation()
+            if result >= 0 { return result }
+            let code = errno
+            if code == EINTR { continue }
+            throw posixError(message, code: code)
+        }
     }
 
     /// Descends from `/` one descriptor at a time so `O_NOFOLLOW` protects
@@ -337,7 +636,15 @@ final class PinnedDestinationDirectory: @unchecked Sendable {
     }
 
     private static func posixError(_ message: String) -> NSError {
-        NSError(domain: NSPOSIXErrorDomain, code: Int(errno), userInfo: [NSLocalizedDescriptionKey: message + ": " + String(cString: strerror(errno))])
+        posixError(message, code: errno)
+    }
+
+    private static func posixError(_ message: String, code: Int32) -> NSError {
+        NSError(
+            domain: NSPOSIXErrorDomain,
+            code: Int(code),
+            userInfo: [NSLocalizedDescriptionKey: message + ": " + String(cString: strerror(code))]
+        )
     }
 }
 
@@ -360,8 +667,21 @@ final class PinnedDestinationFile: @unchecked Sendable {
         _ = Darwin.close(parentFD)
     }
 
-    static func open(named name: String, relativeTo parentFD: Int32) throws -> PinnedDestinationFile {
+    static func open(
+        named name: String,
+        relativeTo parentFD: Int32,
+        expectedIdentity: PublishedFileIdentity? = nil
+    ) throws -> PinnedDestinationFile {
         let fileFD = try openRegularFile(named: name, relativeTo: parentFD)
+        var openedInfo = stat()
+        guard fstat(fileFD, &openedInfo) == 0 else {
+            _ = Darwin.close(fileFD)
+            throw posixError("Unable to inspect opened destination file")
+        }
+        if let expectedIdentity, !expectedIdentity.matches(openedInfo) {
+            _ = Darwin.close(fileFD)
+            throw DestinationPublicationFailure.ownershipLost(identity: expectedIdentity)
+        }
         let retainedParentFD = Darwin.dup(parentFD)
         guard retainedParentFD >= 0 else {
             _ = Darwin.close(fileFD)
@@ -392,7 +712,9 @@ final class PinnedDestinationFile: @unchecked Sendable {
               actual.st_dev == expected.st_dev,
               actual.st_ino == expected.st_ino else {
             _ = Darwin.close(readerFD)
-            throw FileCopyService.existingDestinationConflictError("Pinned destination file changed before reading")
+            throw DestinationPublicationFailure.ownershipLost(
+                identity: PublishedFileIdentity(expected)
+            )
         }
         return FileHandle(fileDescriptor: readerFD, closeOnDealloc: true)
     }
@@ -405,22 +727,22 @@ final class PinnedDestinationFile: @unchecked Sendable {
               actual.st_dev == expected.st_dev,
               actual.st_ino == expected.st_ino else {
             _ = Darwin.close(readerFD)
-            throw FileCopyService.existingDestinationConflictError("Pinned destination file changed before readback")
+            throw DestinationPublicationFailure.ownershipLost(
+                identity: PublishedFileIdentity(expected)
+            )
         }
         return (readerFD, expected)
     }
 
-    func removeNamedFileIfStillThisFile() -> Bool {
+    func nameStillIdentifiesThisFile() -> Bool {
         guard let expected = try? snapshot() else { return false }
-        return PinnedDestinationDirectory.removePublishedFile(
-            named: name,
-            relativeTo: parentFD,
-            expected: expected
-        )
-    }
-
-    func synchronizeParent(using durabilityIO: any TransferDurabilityIO) {
-        _ = durabilityIO.syncDirectory(fileDescriptor: parentFD)
+        let readerFD = name.withCString { openat(parentFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard readerFD >= 0 else { return false }
+        defer { _ = Darwin.close(readerFD) }
+        var actual = stat()
+        return fstat(readerFD, &actual) == 0
+            && actual.st_dev == expected.st_dev
+            && actual.st_ino == expected.st_ino
     }
 
     private static func openRegularFile(named name: String, relativeTo parentFD: Int32) throws -> Int32 {
@@ -892,11 +1214,12 @@ final class FileCopyService {
         let destinationHandle = FileHandle(fileDescriptor: temporaryFD, closeOnDealloc: false)
         var published = false
         var destinationClosed = false
+        var preserveTemporaryForRecovery = false
         defer {
             if !destinationClosed {
                 closeFileHandle(destinationHandle, context: temporaryName)
             }
-            if !published {
+            if !published && !preserveTemporaryForRecovery {
                 PinnedDestinationDirectory.removeItem(named: temporaryName, relativeTo: parentFD)
             }
         }
@@ -999,24 +1322,40 @@ final class FileCopyService {
             throw NSError(domain: "FileCopyService", code: -2, userInfo: [NSLocalizedDescriptionKey: "Size mismatch after copy"])
         }
 
-        try durabilityIO?.prepareForPublication(destinationPath: destinationPath)
-        try PinnedDestinationDirectory.publishTemporaryFile(named: temporaryName, as: filename, relativeTo: parentFD)
+        let publicationDurabilityIO: any TransferDurabilityIO = durabilityIO ?? DarwinTransferDurabilityIO()
+        try publicationDurabilityIO.prepareForPublication(destinationPath: destinationPath)
+        let publication: FilePublicationResult
+        do {
+            publication = try PinnedDestinationDirectory.publishTemporaryFile(
+                named: temporaryName,
+                temporaryFileDescriptor: temporaryFD,
+                expectedTemporaryFile: temporaryInfo,
+                as: filename,
+                relativeTo: parentFD,
+                destinationPath: destinationPath,
+                durabilityIO: publicationDurabilityIO
+            )
+        } catch let failure as DestinationPublicationFailure {
+            preserveTemporaryForRecovery = failure.finalNameWasClaimed
+            durabilityFacts.publicationInterrupted = failure.finalNameWasClaimed
+            durabilityFacts.publicationIdentity = failure.claimedIdentity
+            durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
+            throw failure
+        }
+        if let finalFullSync = publication.finalFullSync {
+            durabilityFacts.fullSync = finalFullSync
+        }
+        durabilityFacts.publicationIdentity = publication.identity
         durabilityFacts.publicationSucceeded = true
         if let durabilityIO {
             let directorySync = durabilityIO.syncDirectory(fileDescriptor: parentFD)
             durabilityFacts.directorySync = directorySync
             durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
             if case .failed = directorySync {
-                if PinnedDestinationDirectory.removePublishedFile(
-                    named: filename,
-                    relativeTo: parentFD,
-                    expected: temporaryInfo
-                ) {
-                    durabilityFacts.publicationSucceeded = false
-                    durabilityFacts.publicationRemovedAfterFailure = true
-                    _ = durabilityIO.syncDirectory(fileDescriptor: parentFD)
-                    durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
-                }
+                // Publication is now ambiguous. Preserve the final entry rather
+                // than racing a concurrent replacement with check-then-unlink.
+                durabilityFacts.publicationInterrupted = true
+                durabilityRecorder?.recordCopyFacts(durabilityFacts, destinationPath: destinationPath)
                 throw TransferDurabilityError.syscall("destination directory fsync", outcome: directorySync)
             }
         }
@@ -1272,37 +1611,36 @@ final class FileCopyService {
         guard let components = safeRelativeComponents(relativePath) else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
         }
-        let destination = try pinnedRoot.openRegularFile(at: components)
+        let destinationPath = pinnedRoot.destinationURL(for: relativePath).path
+        let copyFacts = durabilityRecorder?.copyFacts(destinationPath: destinationPath)
+        let expectedIdentity: PublishedFileIdentity?
+        if copyFacts?.publicationSucceeded == true,
+           copyFacts?.reusedExistingDestination == false {
+            guard let recordedIdentity = copyFacts?.publicationIdentity else {
+                throw NSError(
+                    domain: DestinationPublicationFailure.errorDomain,
+                    code: DestinationPublicationFailure.Kind.ownershipLost.rawValue,
+                    userInfo: [NSLocalizedDescriptionKey: "Published destination identity is missing"]
+                )
+            }
+            expectedIdentity = recordedIdentity
+        } else {
+            expectedIdentity = nil
+        }
+        let destination = try pinnedRoot.openRegularFile(
+            at: components,
+            expectedIdentity: expectedIdentity
+        )
         let startTime = Date()
 
         if verificationMode == .standard, let durabilityIO {
-            let destinationPath = pinnedRoot.destinationURL(for: relativePath).path
-            do {
-                let result = try await durableSHA256Verification(
-                    source: source,
-                    destination: destination,
-                    destinationPath: destinationPath,
-                    durabilityIO: durabilityIO,
-                    durabilityRecorder: durabilityRecorder
-                )
-                if !result.matches {
-                    rollbackWorkerPublication(
-                        destination: destination,
-                        destinationPath: destinationPath,
-                        durabilityIO: durabilityIO,
-                        durabilityRecorder: durabilityRecorder
-                    )
-                }
-                return result
-            } catch {
-                rollbackWorkerPublication(
-                    destination: destination,
-                    destinationPath: destinationPath,
-                    durabilityIO: durabilityIO,
-                    durabilityRecorder: durabilityRecorder
-                )
-                throw error
-            }
+            return try await durableSHA256Verification(
+                source: source,
+                destination: destination,
+                destinationPath: destinationPath,
+                durabilityIO: durabilityIO,
+                durabilityRecorder: durabilityRecorder
+            )
         }
 
         if verificationMode == .paranoid {
@@ -1359,22 +1697,6 @@ final class FileCopyService {
             processingTime: totalProcessing,
             fileSize: base.fileSize
         )
-    }
-
-    private static func rollbackWorkerPublication(
-        destination: PinnedDestinationFile,
-        destinationPath: String,
-        durabilityIO: any TransferDurabilityIO,
-        durabilityRecorder: (any TransferDurabilityRecorder)?
-    ) {
-        guard var copy = durabilityRecorder?.copyFacts(destinationPath: destinationPath),
-              copy.publicationSucceeded,
-              !copy.reusedExistingDestination,
-              destination.removeNamedFileIfStillThisFile() else { return }
-        copy.publicationSucceeded = false
-        copy.publicationRemovedAfterFailure = true
-        durabilityRecorder?.recordCopyFacts(copy, destinationPath: destinationPath)
-        destination.synchronizeParent(using: durabilityIO)
     }
 
     private static func durableSHA256Verification(
@@ -1463,6 +1785,11 @@ final class FileCopyService {
                 domain: "BitMatchTransferWorker.Readback",
                 code: -4,
                 userInfo: [NSLocalizedDescriptionKey: "Destination changed during full readback"]
+            )
+        }
+        guard destination.nameStillIdentifiesThisFile() else {
+            throw DestinationPublicationFailure.ownershipLost(
+                identity: PublishedFileIdentity(openedDestination.expected)
             )
         }
         facts.fullReadPerformed = true

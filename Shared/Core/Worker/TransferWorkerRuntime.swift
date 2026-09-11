@@ -1108,6 +1108,14 @@ private func workerErrorCode(for result: FileOperationResult) -> String {
         if message.contains("directory") { return "directory-flush-failed" }
         return "durability-failed"
     }
+    if error?.domain == DestinationPublicationFailure.errorDomain {
+        switch error?.code {
+        case DestinationPublicationFailure.Kind.ownershipLost.rawValue:
+            return "publication-ownership-lost"
+        default:
+            return "publication-interrupted"
+        }
+    }
     if message.contains("appeared during copy") { return "publication-collision" }
     if message.contains("source file changed") { return "source-mutated" }
     if error?.domain == NSPOSIXErrorDomain, error?.code == Int(ENOENT) { return "destination-disappeared" }

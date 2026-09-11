@@ -13,6 +13,7 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     var returnShortRead = false
     var corruptReadback = false
     var publicationHook: ((String) throws -> Void)?
+    var claimedPublicationHook: ((String) throws -> Void)?
     var sourceVerificationHook: ((String) throws -> Void)?
     var destinationWriteHook: ((String, Int) throws -> Void)?
     var fullSyncObserver: ((Int32) -> Void)?
@@ -46,6 +47,9 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     func syncDirectory(fileDescriptor: Int32) -> TransferSystemCallOutcome { directorySyncOutcome }
     func requestCacheBypass(fileDescriptor: Int32) -> TransferSystemCallOutcome { cacheBypassOutcome }
     func prepareForPublication(destinationPath: String) throws { try publicationHook?(destinationPath) }
+    func prepareForClaimedPublication(destinationPath: String) throws {
+        try claimedPublicationHook?(destinationPath)
+    }
     func prepareForSourceVerification(sourcePath: String) throws { try sourceVerificationHook?(sourcePath) }
     func prepareForDestinationChunkWrite(destinationPath: String, byteCount: Int) throws {
         try destinationWriteHook?(destinationPath, byteCount)
@@ -603,7 +607,7 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(records.reduce(0) { $0 + $1.destinationReadbackBytes }, result.evidence?.source.totalBytes)
     }
 
-    func testReadbackChecksumMismatchFails() async throws {
+    func testReadbackChecksumMismatchFailsAndRetainsPublishedFile() async throws {
         let io = FaultingDurabilityIO()
         io.corruptReadback = true
         let result = await TransferWorkerRuntime(durabilityIO: io).run(
@@ -615,16 +619,16 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
         let records = try detailRecords(from: result)
         XCTAssertTrue(records.contains { $0.verificationOutcome == .failed })
-        let rolledBack = records.filter { $0.publication == .removedAfterFailure }
-        XCTAssertFalse(rolledBack.isEmpty)
-        XCTAssertTrue(rolledBack.allSatisfy {
-            !FileManager.default.fileExists(
+        let retained = records.filter { $0.verificationOutcome == .failed && $0.publication == .published }
+        XCTAssertFalse(retained.isEmpty)
+        XCTAssertTrue(retained.allSatisfy {
+            FileManager.default.fileExists(
                 atPath: destinationA.appendingPathComponent("source/\($0.relativePath)").path
             )
         })
     }
 
-    func testShortDestinationReadbackFails() async throws {
+    func testShortDestinationReadbackFailsAndRetainsPublishedFile() async throws {
         let io = FaultingDurabilityIO()
         io.returnShortRead = true
         let result = await TransferWorkerRuntime(durabilityIO: io).run(
@@ -635,7 +639,9 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, .completedWithFailures)
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "short-readback" } == true)
-        XCTAssertTrue(try detailRecords(from: result).contains { $0.publication == .removedAfterFailure })
+        XCTAssertTrue(try detailRecords(from: result).contains {
+            $0.verificationOutcome == .failed && $0.publication == .published
+        })
     }
 
     func testFullSyncFailureCannotReportStrongOrPublishFinalFile() async throws {
@@ -701,7 +707,7 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(summary.degradedFiles, 2)
     }
 
-    func testDirectorySyncFailureRollsBackPublishedFile() async throws {
+    func testDirectorySyncFailureRetainsAmbiguousPublishedFile() async throws {
         let io = FaultingDurabilityIO()
         io.directorySyncOutcome = .failed(code: EIO, message: "simulated directory sync failure")
         let result = await TransferWorkerRuntime(durabilityIO: io).run(
@@ -711,10 +717,13 @@ final class TransferWorkerTests: XCTestCase {
 
         XCTAssertEqual(result.exitCode, .completedWithFailures)
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
-        XCTAssertFalse(FileManager.default.fileExists(
+        XCTAssertTrue(FileManager.default.fileExists(
             atPath: destinationA.appendingPathComponent("source/camera-like-file-1.bin").path
         ))
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "directory-flush-failed" } == true)
+        XCTAssertTrue(try detailRecords(from: result).contains {
+            $0.verificationOutcome == .failed && $0.publication == .published
+        })
     }
 
     func testUnsupportedCacheBypassIsExplicitlyDegraded() async throws {
@@ -732,7 +741,7 @@ final class TransferWorkerTests: XCTestCase {
         })
     }
 
-    func testCacheBypassFailureRollsBackNewPublication() async throws {
+    func testCacheBypassFailureRetainsPublishedFile() async throws {
         let io = FaultingDurabilityIO()
         io.cacheBypassOutcome = .failed(code: EIO, message: "simulated cache bypass failure")
         let result = await TransferWorkerRuntime(durabilityIO: io).run(
@@ -743,7 +752,9 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.exitCode, .completedWithFailures)
         XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "cache-bypass-failed" } == true)
-        XCTAssertTrue(try detailRecords(from: result).contains { $0.publication == .removedAfterFailure })
+        XCTAssertTrue(try detailRecords(from: result).contains {
+            $0.verificationOutcome == .failed && $0.publication == .published
+        })
     }
 
     func testSourceMutationBetweenCopyAndReadbackIsCaught() async throws {
@@ -788,6 +799,210 @@ final class TransferWorkerTests: XCTestCase {
         let items = try FileManager.default.contentsOfDirectory(atPath: outputDirectory.path)
         XCTAssertFalse(items.contains { $0.hasPrefix(".bitmatch.tmp.") })
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "publication-collision" } == true)
+    }
+
+    // These tests call the FAT-family fallback directly because the test volume
+    // supports hard links and therefore cannot naturally select that branch.
+    func testExFATFallbackPublishesFreeNamePreservesMtimeAndFlushesFinalInode() throws {
+        let pinned = try PinnedDestinationDirectory.open(destination: destinationA, rootComponents: [])
+        let parentFD = try pinned.openOrCreateDirectory(at: [])
+        defer { _ = Darwin.close(parentFD) }
+
+        let temporaryName = ".bitmatch.tmp.fallback-success"
+        let temporaryFD = try PinnedDestinationDirectory.createTemporaryFile(
+            named: temporaryName,
+            relativeTo: parentFD
+        )
+        defer { _ = Darwin.close(temporaryFD) }
+        let payload = Data("verified-payload".utf8)
+        XCTAssertEqual(
+            payload.withUnsafeBytes { Darwin.write(temporaryFD, $0.baseAddress, $0.count) },
+            payload.count
+        )
+        var times = [timespec(tv_sec: 1_700_000_000, tv_nsec: 0), timespec(tv_sec: 1_700_000_000, tv_nsec: 0)]
+        XCTAssertEqual(futimens(temporaryFD, &times), 0)
+        var temporaryInfo = stat()
+        XCTAssertEqual(fstat(temporaryFD, &temporaryInfo), 0)
+
+        let io = FaultingDurabilityIO()
+        var flushedIdentity: PublishedFileIdentity?
+        io.fullSyncObserver = { descriptor in
+            var info = stat()
+            if fstat(descriptor, &info) == 0 {
+                flushedIdentity = PublishedFileIdentity(info)
+            }
+        }
+        let publication = try PinnedDestinationDirectory.publishByClaimingNameThenCopying(
+            temporaryName: temporaryName,
+            temporaryFileDescriptor: temporaryFD,
+            expectedTemporaryFile: temporaryInfo,
+            as: "published.bin",
+            relativeTo: parentFD,
+            destinationPath: destinationA.appendingPathComponent("published.bin").path,
+            durabilityIO: io
+        )
+
+        let finalURL = destinationA.appendingPathComponent("published.bin")
+        XCTAssertEqual(try Data(contentsOf: finalURL), payload)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: destinationA.appendingPathComponent(temporaryName).path))
+        XCTAssertEqual(flushedIdentity, publication.identity)
+        let attributes = try FileManager.default.attributesOfItem(atPath: finalURL.path)
+        XCTAssertEqual((attributes[.modificationDate] as? Date)?.timeIntervalSince1970, 1_700_000_000)
+    }
+
+    func testExFATFallbackCollisionTouchesNeitherExistingNorTemporaryFile() throws {
+        let pinned = try PinnedDestinationDirectory.open(destination: destinationA, rootComponents: [])
+        let parentFD = try pinned.openOrCreateDirectory(at: [])
+        defer { _ = Darwin.close(parentFD) }
+
+        let existingURL = destinationA.appendingPathComponent("published.bin")
+        let existingBytes = Data("concurrent-owner".utf8)
+        try existingBytes.write(to: existingURL)
+        let temporaryName = ".bitmatch.tmp.fallback-collision"
+        let temporaryFD = try PinnedDestinationDirectory.createTemporaryFile(
+            named: temporaryName,
+            relativeTo: parentFD
+        )
+        defer { _ = Darwin.close(temporaryFD) }
+        let payload = Data("verified-payload".utf8)
+        XCTAssertEqual(
+            payload.withUnsafeBytes { Darwin.write(temporaryFD, $0.baseAddress, $0.count) },
+            payload.count
+        )
+        var temporaryInfo = stat()
+        XCTAssertEqual(fstat(temporaryFD, &temporaryInfo), 0)
+
+        XCTAssertThrowsError(try PinnedDestinationDirectory.publishByClaimingNameThenCopying(
+            temporaryName: temporaryName,
+            temporaryFileDescriptor: temporaryFD,
+            expectedTemporaryFile: temporaryInfo,
+            as: "published.bin",
+            relativeTo: parentFD,
+            destinationPath: existingURL.path,
+            durabilityIO: FaultingDurabilityIO()
+        )) { error in
+            let error = error as NSError
+            XCTAssertEqual(error.domain, NSPOSIXErrorDomain)
+            XCTAssertEqual(error.code, Int(EEXIST))
+        }
+
+        XCTAssertEqual(try Data(contentsOf: existingURL), existingBytes)
+        XCTAssertEqual(try Data(contentsOf: destinationA.appendingPathComponent(temporaryName)), payload)
+    }
+
+    func testExFATFallbackDetectsMidCopyReplacementAndNeverDeletesReplacement() throws {
+        let pinned = try PinnedDestinationDirectory.open(destination: destinationA, rootComponents: [])
+        let parentFD = try pinned.openOrCreateDirectory(at: [])
+        defer { _ = Darwin.close(parentFD) }
+
+        let temporaryName = ".bitmatch.tmp.fallback-replacement"
+        let temporaryFD = try PinnedDestinationDirectory.createTemporaryFile(
+            named: temporaryName,
+            relativeTo: parentFD
+        )
+        defer { _ = Darwin.close(temporaryFD) }
+        let payload = Data("verified-payload".utf8)
+        XCTAssertEqual(
+            payload.withUnsafeBytes { Darwin.write(temporaryFD, $0.baseAddress, $0.count) },
+            payload.count
+        )
+        var temporaryInfo = stat()
+        XCTAssertEqual(fstat(temporaryFD, &temporaryInfo), 0)
+
+        let finalURL = destinationA.appendingPathComponent("published.bin")
+        let replacementURL = destinationA.appendingPathComponent("concurrent-writer.tmp")
+        let replacementBytes = Data("concurrent-writer-must-survive".utf8)
+        let io = FaultingDurabilityIO()
+        io.claimedPublicationHook = { path in
+            try replacementBytes.write(to: replacementURL)
+            guard Darwin.rename(replacementURL.path, path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+        }
+
+        XCTAssertThrowsError(try PinnedDestinationDirectory.publishByClaimingNameThenCopying(
+            temporaryName: temporaryName,
+            temporaryFileDescriptor: temporaryFD,
+            expectedTemporaryFile: temporaryInfo,
+            as: "published.bin",
+            relativeTo: parentFD,
+            destinationPath: finalURL.path,
+            durabilityIO: io
+        )) { error in
+            let error = error as NSError
+            XCTAssertEqual(error.domain, DestinationPublicationFailure.errorDomain)
+            XCTAssertEqual(error.code, DestinationPublicationFailure.Kind.ownershipLost.rawValue)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: finalURL), replacementBytes)
+        XCTAssertEqual(try Data(contentsOf: destinationA.appendingPathComponent(temporaryName)), payload)
+    }
+
+    func testExFATFallbackPostClaimFailureRetainsClaimAndVerifiedTemporaryForRecovery() throws {
+        let pinned = try PinnedDestinationDirectory.open(destination: destinationA, rootComponents: [])
+        let parentFD = try pinned.openOrCreateDirectory(at: [])
+        defer { _ = Darwin.close(parentFD) }
+
+        let temporaryName = ".bitmatch.tmp.fallback-interrupted"
+        let temporaryFD = try PinnedDestinationDirectory.createTemporaryFile(
+            named: temporaryName,
+            relativeTo: parentFD
+        )
+        defer { _ = Darwin.close(temporaryFD) }
+        let payload = Data("verified-payload".utf8)
+        XCTAssertEqual(
+            payload.withUnsafeBytes { Darwin.write(temporaryFD, $0.baseAddress, $0.count) },
+            payload.count
+        )
+        var temporaryInfo = stat()
+        XCTAssertEqual(fstat(temporaryFD, &temporaryInfo), 0)
+
+        let finalURL = destinationA.appendingPathComponent("published.bin")
+        let io = FaultingDurabilityIO()
+        io.claimedPublicationHook = { _ in
+            throw NSError(domain: NSPOSIXErrorDomain, code: Int(EIO))
+        }
+        XCTAssertThrowsError(try PinnedDestinationDirectory.publishByClaimingNameThenCopying(
+            temporaryName: temporaryName,
+            temporaryFileDescriptor: temporaryFD,
+            expectedTemporaryFile: temporaryInfo,
+            as: "published.bin",
+            relativeTo: parentFD,
+            destinationPath: finalURL.path,
+            durabilityIO: io
+        )) { error in
+            let error = error as NSError
+            XCTAssertEqual(error.domain, DestinationPublicationFailure.errorDomain)
+            XCTAssertEqual(error.code, DestinationPublicationFailure.Kind.interrupted.rawValue)
+        }
+
+        XCTAssertEqual(try Data(contentsOf: finalURL), Data())
+        XCTAssertEqual(try Data(contentsOf: destinationA.appendingPathComponent(temporaryName)), payload)
+    }
+
+    func testChecksumIdenticalReplacementBeforeReadbackStillFailsOwnershipCheck() async throws {
+        let io = FaultingDurabilityIO()
+        var replaced = false
+        let finalURL = destinationA.appendingPathComponent("source/camera-like-file-1.bin")
+        let replacementBytes = try Data(contentsOf: source.appendingPathComponent("camera-like-file-1.bin"))
+        io.sourceVerificationHook = { _ in
+            guard !replaced, FileManager.default.fileExists(atPath: finalURL.path) else { return }
+            replaced = true
+            let replacementURL = finalURL.deletingLastPathComponent().appendingPathComponent("concurrent.tmp")
+            try replacementBytes.write(to: replacementURL)
+            guard Darwin.rename(replacementURL.path, finalURL.path) == 0 else {
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(errno))
+            }
+        }
+
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)]),
+            evidenceURL: root.appendingPathComponent("replacement-before-readback.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "publication-ownership-lost" } == true)
+        XCTAssertEqual(try Data(contentsOf: finalURL), replacementBytes)
     }
 
     func testGUIPreferenceCannotDisableWorkerChecksumPolicy() async throws {
