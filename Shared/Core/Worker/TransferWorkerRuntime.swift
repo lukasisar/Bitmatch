@@ -307,13 +307,13 @@ enum WorkerResultSetValidator {
 
 public struct TransferWorkerRuntime {
     public static let supportedCapabilities = [
-        "atomic-no-overwrite",
         "bounded-detail-evidence",
         "darwin-full-fsync-facts",
         "directory-publication-flush",
         "exact-result-set-validation",
         "full-destination-readback",
         "macos-physical-storage-topology-facts",
+        "no-overwrite-publication",
         "os-cache-bypass-request",
         "sha256-verification",
         "single-source-read-fanout",
@@ -1079,11 +1079,10 @@ private func makeFileEvidence(
         cacheBypass: operationFact(readback.cacheBypass),
         durabilityFlush: operationFact(copy.fullSync),
         directoryMetadataFlush: operationFact(copy.directorySync),
+        publicationInterrupted: copy.publicationInterrupted,
         publication: copy.reusedExistingDestination
             ? .reusedExisting
-            : copy.publicationRemovedAfterFailure
-                ? .removedAfterFailure
-                : copy.publicationSucceeded ? .published : .notPublished,
+            : copy.publicationSucceeded ? .published : .notPublished,
         error: typedError
     )
 }
@@ -1107,6 +1106,14 @@ private func workerErrorCode(for result: FileOperationResult) -> String {
         if message.contains("f_nocache") { return "cache-bypass-failed" }
         if message.contains("directory") { return "directory-flush-failed" }
         return "durability-failed"
+    }
+    if error?.domain == DestinationPublicationFailure.errorDomain {
+        switch error?.code {
+        case DestinationPublicationFailure.Kind.ownershipLost.rawValue:
+            return "publication-ownership-lost"
+        default:
+            return "publication-interrupted"
+        }
     }
     if message.contains("appeared during copy") { return "publication-collision" }
     if message.contains("source file changed") { return "source-mutated" }

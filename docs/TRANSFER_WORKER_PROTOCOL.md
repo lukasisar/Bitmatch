@@ -46,7 +46,8 @@ preferences are not protocol inputs.
 - protocol version `3`;
 - verification policy `sha256` and algorithm `SHA-256`;
 - at most 16 destinations;
-- atomic no-overwrite publication for copied files;
+- no-overwrite publication for copied files (atomic visibility where hard links
+  are available, direct exclusive-name publication on exFAT/FAT);
 - bounded detailed evidence;
 - the source-read-only guarantee;
 - pre-publication SHA-256 verification of worker-owned temporary files;
@@ -133,18 +134,43 @@ exclusive worker-owned temporary file
   -> ordinary synchronize/fsync
   -> SHA-256-check the temporary bytes before publication
   -> recheck opened-source stability
-  -> request Darwin F_FULLFSYNC for the final data + preserved-mtime state
-  -> atomic linkat no-overwrite publication
+  -> request Darwin F_FULLFSYNC for the verified temporary inode
+  -> publish without replacing an existing final name:
+       hard-link filesystem: atomic linkat publication
+       exFAT/FAT: O_EXCL claim of the real final name, then descriptor copy,
+                  mtime preservation, fsync, and F_FULLFSYNC of the final inode
+  -> bind subsequent evidence to the published st_dev/st_ino identity
   -> remove only the worker-owned temporary name
   -> fsync the containing destination directory
-  -> independently reopen final file and perform full readback
+  -> independently reopen the same final identity and perform full readback
 ```
 
 A pre-existing destination is never replaced. A matching regular file may be
 reused only after checksum verification, but is reported as degraded because
 this attempt did not perform its original write, flush, or publication. A
-conflicting item is preserved and reported as a failure. Cleanup applies only
-to names created by this attempt with the `.bitmatch.tmp.` prefix.
+conflicting item is preserved and reported as a failure.
+
+`linkat` is the preferred publication primitive because it provides both
+atomic visibility and no-clobber publication. exFAT has no hard links, and
+macOS does not provide a working exclusive-rename primitive on the qualified
+exFAT volumes. On an explicit `ENOTSUP`/`EOPNOTSUPP` from `linkat`, the worker
+therefore keeps the non-negotiable no-clobber property and gives up atomic
+visibility: `O_CREAT | O_EXCL` claims the real final name, and the worker copies
+the already-verified bytes directly between the still-open temporary and final
+descriptors. The final inode receives its own timestamp preservation, ordinary
+`fsync`, and `F_FULLFSYNC`; the temporary inode's earlier flush is not reused as
+evidence for this distinct object.
+
+The claimed final identity is recorded before copying and required again before
+readback and after the complete read. A replacement is rejected even if its
+size and SHA-256 happen to match the source, so a different writer's file cannot
+inherit this attempt's durability evidence. The worker never tries to roll back
+a published pathname after a verification or directory-sync failure: identity
+check followed by pathname unlink would itself be a race that could delete a
+concurrent replacement. Instead it fails closed and retains the suspect final
+entry. A failure after an exFAT final-name claim also retains the verified
+temporary entry when it is still present. Such residue requires reconciliation
+or human review and can never be reported as verified.
 
 For each manifest file, V3 opens the source once, freezes its descriptor identity,
 and makes one sequential transfer pass. Each source chunk updates one SHA-256
@@ -155,11 +181,12 @@ mechanism: it retains at most one 4 MiB source chunk regardless of destination
 count or file size. A slow destination therefore slows the producer instead of
 growing a queue.
 
-A destination writer that fails is removed from the active set, its worker-owned
-temporary file is cleaned, and its result remains failed in the exact Cartesian
-result set. Other writers continue receiving the same source stream and can
-independently complete. One successful destination never changes the requested
-operation as a whole into success when another destination failed.
+A destination writer that fails is removed from the active set and its result
+remains failed in the exact Cartesian result set. A temporary file is cleaned
+only if no final name was claimed; post-claim failures retain recovery evidence.
+Other writers continue receiving the same source stream and can independently
+complete. One successful destination never changes the requested operation as
+a whole into success when another destination failed.
 
 After EOF, the source digest from that single transfer pass is the reference for
 every destination. Each published destination is independently reopened, given
@@ -213,9 +240,9 @@ Detailed file results are streamed to `<evidence>.details.jsonl`, not accumulate
 in the final JSON object. The final reference records its format, record count,
 and SHA-256 digest. Every record exposes the source and destination SHA-256
 digests when available, attempt-wide/read-time source stability facts,
-pre-publication checksum result, publication disposition, complete-readback
-byte count, and separate outcomes for `F_FULLFSYNC`, directory `fsync`, and
-`F_NOCACHE`.
+pre-publication checksum result, publication disposition, an explicit
+`publicationInterrupted` fact, complete-readback byte count, and separate
+outcomes for `F_FULLFSYNC`, directory `fsync`, and `F_NOCACHE`.
 
 Both detailed and final artifacts are written under unique `.partial-*` names
 and atomically renamed only when complete. Existing final artifacts are never
@@ -275,7 +302,7 @@ strong destinations can still have `samePhysicalDevice` or `unknown` topology.
 | SHA-256 destination match | The independently reopened destination produced the same SHA-256 digest as the one-pass transfer source digest; the temporary file was also checked before publication. | Physical media residence, future readability, or device independence. |
 | Ordinary synchronize/fsync | The OS accepted its normal file-data synchronization request. | That a device with volatile caches committed bytes to NAND/platter. |
 | Darwin `F_FULLFSYNC` success | After data writing, mtime preservation, temporary SHA-256, and source-stability checks, macOS accepted the stronger full-sync request for that pre-publication inode state. | Absolute physical persistence; later publication metadata and bridges, filesystems, firmware, and hardware remain separately bounded. |
-| Atomic no-overwrite publication + directory fsync | The final name was created without replacing an existing item and the OS accepted synchronization of its containing directory metadata. | That all higher/lower storage layers are power-loss proof. |
+| No-overwrite publication + identity binding + directory fsync | The final name was claimed without replacing an existing item, still named the inode claimed by this attempt, and the OS accepted synchronization of its containing directory metadata. | Atomic visibility on exFAT, immunity from later mutation by another process, or power-loss proof across every storage layer. |
 | Full `F_NOCACHE`-requested readback | An independently reopened final descriptor returned the complete expected byte count and matching SHA-256 while the OS-cache-bypass request was active. | A guaranteed physical reread from flash/platter; `F_NOCACHE` is an OS-cache-bypass request only. |
 | Physical-leaf relationship | macOS storage facts resolved two destinations to the same or different single underlying physical leaf. | Integrity, durability, Safe-to-clear, or independence when the result is `unknown`. |
 
@@ -291,8 +318,12 @@ strong destinations can still have `samePhysicalDevice` or `unknown` topology.
 | `70` | `internalFailure` | Unexpected worker or evidence-publication failure. |
 
 The caller must require both the expected process result and a complete,
-decodable evidence artifact matching its job and attempt. PP-017 does not solve
-unknown-success reconciliation after a process crash.
+decodable evidence artifact matching its job and attempt. Typed
+`publication-interrupted` and `publication-ownership-lost` errors distinguish
+post-claim ambiguity from an ordinary pre-publication failure. A process crash
+can still prevent final evidence from being written; a partial exFAT final file
+or retained `.bitmatch.tmp.` file is deliberately treated as unresolved residue,
+never inferred success and never automatically deleted by pathname.
 
 ## Explicitly deferred work
 

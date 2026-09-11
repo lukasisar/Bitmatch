@@ -35,6 +35,14 @@ transfer-byte pass fanned out to all requested destinations, and protocol V3
 reports conservative macOS physical-leaf topology separately from integrity and
 durability outcomes. These changes do not move the recorded upstream fork point.
 
+The PP-019 exFAT compatibility hardening preserves the existing `linkat` path on
+hard-link-capable filesystems and adds a fail-closed fallback for filesystems
+that explicitly reject hard links. The fallback exclusively claims the real
+final name, copies through pinned descriptors, flushes and verifies the distinct
+final inode, binds readback evidence to that inode identity, and retains
+ambiguous artifacts instead of performing racy pathname rollback. It does not
+change the recorded upstream fork point or the V3 wire contract.
+
 Future updates must record any new upstream base or cherry-picked upstream
 revision here. The PP-017 pull request is intentionally review-only and must not
 be merged as part of this issue.

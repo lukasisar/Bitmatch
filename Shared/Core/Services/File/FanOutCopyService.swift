@@ -60,6 +60,7 @@ private final class FanOutTemporaryWriter {
     let handle: FileHandle
     var published = false
     var closed = false
+    var preserveTemporaryForRecovery = false
 
     init(target: FanOutDestinationTarget, relativeComponents: [String]) throws {
         self.target = target
@@ -89,7 +90,7 @@ private final class FanOutTemporaryWriter {
             try? handle.close()
             closed = true
         }
-        if !published {
+        if !published && !preserveTemporaryForRecovery {
             PinnedDestinationDirectory.removeItem(named: temporaryName, relativeTo: parentFD)
         }
     }
@@ -353,106 +354,108 @@ extension FileCopyService {
         guard let components = fanOutRelativeComponents(relativePath) else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
         }
-        let destination = try pinnedRoot.openRegularFile(at: components)
         let startedAt = Date()
         let destinationPath = pinnedRoot.destinationURL(for: relativePath).path
-
-        do {
-            try durabilityIO.prepareForSourceVerification(sourcePath: source.path)
-            let sourceFD = source.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
-            guard sourceFD >= 0 else { throw fanOutPOSIXError("Unable to reopen source read-only for stability check") }
-            var currentSource = stat()
-            let sourceStable = fstat(sourceFD, &currentSource) == 0
-                && (currentSource.st_mode & S_IFMT) == S_IFREG
-                && sourceIdentity.matches(currentSource)
-            _ = Darwin.close(sourceFD)
-            guard sourceStable else {
+        let copyFacts = durabilityRecorder?.copyFacts(destinationPath: destinationPath)
+        let expectedIdentity: PublishedFileIdentity?
+        if copyFacts?.publicationSucceeded == true,
+           copyFacts?.reusedExistingDestination == false {
+            guard let recordedIdentity = copyFacts?.publicationIdentity else {
                 throw NSError(
-                    domain: "BitMatchTransferWorker.Readback",
-                    code: -2,
-                    userInfo: [NSLocalizedDescriptionKey: "Source file changed after the fan-out read"]
+                    domain: DestinationPublicationFailure.errorDomain,
+                    code: DestinationPublicationFailure.Kind.ownershipLost.rawValue,
+                    userInfo: [NSLocalizedDescriptionKey: "Published destination identity is missing"]
                 )
             }
+            expectedIdentity = recordedIdentity
+        } else {
+            expectedIdentity = nil
+        }
+        let destination = try pinnedRoot.openRegularFile(
+            at: components,
+            expectedIdentity: expectedIdentity
+        )
 
-            let opened = try destination.independentReadingDescriptor()
-            defer { _ = Darwin.close(opened.descriptor) }
-            guard Int64(opened.expected.st_size) == expectedSize else {
-                throw NSError(
-                    domain: "BitMatchTransferWorker.Readback",
-                    code: -3,
-                    userInfo: [NSLocalizedDescriptionKey: "Destination size differs before full readback"]
-                )
-            }
+        try durabilityIO.prepareForSourceVerification(sourcePath: source.path)
+        let sourceFD = source.path.withCString { Darwin.open($0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC) }
+        guard sourceFD >= 0 else { throw fanOutPOSIXError("Unable to reopen source read-only for stability check") }
+        var currentSource = stat()
+        let sourceStable = fstat(sourceFD, &currentSource) == 0
+            && (currentSource.st_mode & S_IFMT) == S_IFREG
+            && sourceIdentity.matches(currentSource)
+        _ = Darwin.close(sourceFD)
+        guard sourceStable else {
+            throw NSError(
+                domain: "BitMatchTransferWorker.Readback",
+                code: -2,
+                userInfo: [NSLocalizedDescriptionKey: "Source file changed after the fan-out read"]
+            )
+        }
 
-            var facts = TransferReadbackFacts(sourceRemainedStable: true)
-            let cacheBypass = durabilityIO.requestCacheBypass(fileDescriptor: opened.descriptor)
-            facts.cacheBypass = cacheBypass
-            durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
-            if case .failed = cacheBypass {
-                throw fanOutDurabilityError("F_NOCACHE readback request", outcome: cacheBypass)
-            }
+        let opened = try destination.independentReadingDescriptor()
+        defer { _ = Darwin.close(opened.descriptor) }
+        guard Int64(opened.expected.st_size) == expectedSize else {
+            throw NSError(
+                domain: "BitMatchTransferWorker.Readback",
+                code: -3,
+                userInfo: [NSLocalizedDescriptionKey: "Destination size differs before full readback"]
+            )
+        }
 
-            var hasher = SHA256()
-            while facts.bytesRead < expectedSize {
-                try Task.checkCancellation()
-                let remaining = expectedSize - facts.bytesRead
-                let data = try durabilityIO.readDestination(
-                    fileDescriptor: opened.descriptor,
-                    maximumCount: Int(min(Int64(1024 * 1024), remaining))
-                )
-                guard !data.isEmpty else {
-                    durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
-                    throw NSError(
-                        domain: "BitMatchTransferWorker.Readback",
-                        code: -3,
-                        userInfo: [NSLocalizedDescriptionKey: "Short destination readback: expected \(expectedSize) bytes, read \(facts.bytesRead)"]
-                    )
-                }
-                hasher.update(data: data)
-                facts.bytesRead += Int64(data.count)
-            }
-            let trailing = try durabilityIO.readDestination(fileDescriptor: opened.descriptor, maximumCount: 1)
-            var final = stat()
-            guard trailing.isEmpty,
-                  fstat(opened.descriptor, &final) == 0,
-                  fanOutFileRemainedStable(opened.expected, final) else {
+        var facts = TransferReadbackFacts(sourceRemainedStable: true)
+        let cacheBypass = durabilityIO.requestCacheBypass(fileDescriptor: opened.descriptor)
+        facts.cacheBypass = cacheBypass
+        durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+        if case .failed = cacheBypass {
+            throw fanOutDurabilityError("F_NOCACHE readback request", outcome: cacheBypass)
+        }
+
+        var hasher = SHA256()
+        while facts.bytesRead < expectedSize {
+            try Task.checkCancellation()
+            let remaining = expectedSize - facts.bytesRead
+            let data = try durabilityIO.readDestination(
+                fileDescriptor: opened.descriptor,
+                maximumCount: Int(min(Int64(1024 * 1024), remaining))
+            )
+            guard !data.isEmpty else {
                 durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
                 throw NSError(
-                    domain: "BitMatchTransferWorker.Readback",
-                    code: -4,
-                    userInfo: [NSLocalizedDescriptionKey: "Destination changed during full readback"]
+                    domain: "BitMatchTransferWorker.Readback", code: -3,
+                    userInfo: [NSLocalizedDescriptionKey: "Short destination readback: expected \(expectedSize) bytes, read \(facts.bytesRead)"]
                 )
             }
-            facts.fullReadPerformed = true
-            durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
-
-            let destinationChecksum = hasher.finalize().map { String(format: "%02x", $0) }.joined()
-            let result = VerificationResult(
-                sourceChecksum: referenceSHA256,
-                destinationChecksum: destinationChecksum,
-                matches: referenceSHA256 == destinationChecksum,
-                checksumType: .sha256,
-                processingTime: Date().timeIntervalSince(startedAt),
-                fileSize: expectedSize
-            )
-            if !result.matches {
-                rollbackFanOutPublication(
-                    destination: destination,
-                    destinationPath: destinationPath,
-                    durabilityIO: durabilityIO,
-                    durabilityRecorder: durabilityRecorder
-                )
-            }
-            return result
-        } catch {
-            rollbackFanOutPublication(
-                destination: destination,
-                destinationPath: destinationPath,
-                durabilityIO: durabilityIO,
-                durabilityRecorder: durabilityRecorder
-            )
-            throw error
+            hasher.update(data: data)
+            facts.bytesRead += Int64(data.count)
         }
+        let trailing = try durabilityIO.readDestination(fileDescriptor: opened.descriptor, maximumCount: 1)
+        var final = stat()
+        guard trailing.isEmpty,
+              fstat(opened.descriptor, &final) == 0,
+              fanOutFileRemainedStable(opened.expected, final) else {
+            durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+            throw NSError(
+                domain: "BitMatchTransferWorker.Readback", code: -4,
+                userInfo: [NSLocalizedDescriptionKey: "Destination changed during full readback"]
+            )
+        }
+        guard destination.nameStillIdentifiesThisFile() else {
+            throw DestinationPublicationFailure.ownershipLost(
+                identity: PublishedFileIdentity(opened.expected)
+            )
+        }
+        facts.fullReadPerformed = true
+        durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
+
+        let destinationChecksum = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        return VerificationResult(
+            sourceChecksum: referenceSHA256,
+            destinationChecksum: destinationChecksum,
+            matches: referenceSHA256 == destinationChecksum,
+            checksumType: .sha256,
+            processingTime: Date().timeIntervalSince(startedAt),
+            fileSize: expectedSize
+        )
     }
 
     private static func finalizeFanOutWriter(
@@ -525,26 +528,35 @@ extension FileCopyService {
         }
 
         try durabilityIO.prepareForPublication(destinationPath: writer.destinationPath)
-        try PinnedDestinationDirectory.publishTemporaryFile(
-            named: writer.temporaryName,
-            as: writer.filename,
-            relativeTo: writer.parentFD
-        )
+        let publication: FilePublicationResult
+        do {
+            publication = try PinnedDestinationDirectory.publishTemporaryFile(
+                named: writer.temporaryName,
+                temporaryFileDescriptor: writer.temporaryFD,
+                expectedTemporaryFile: temporaryInfo,
+                as: writer.filename,
+                relativeTo: writer.parentFD,
+                destinationPath: writer.destinationPath,
+                durabilityIO: durabilityIO
+            )
+        } catch let failure as DestinationPublicationFailure {
+            writer.preserveTemporaryForRecovery = failure.finalNameWasClaimed
+            facts.publicationInterrupted = failure.finalNameWasClaimed
+            facts.publicationIdentity = failure.claimedIdentity
+            durabilityRecorder?.recordCopyFacts(facts, destinationPath: writer.destinationPath)
+            throw failure
+        }
+        if let finalFullSync = publication.finalFullSync {
+            facts.fullSync = finalFullSync
+        }
+        facts.publicationIdentity = publication.identity
         facts.publicationSucceeded = true
         let directorySync = durabilityIO.syncDirectory(fileDescriptor: writer.parentFD)
         facts.directorySync = directorySync
         durabilityRecorder?.recordCopyFacts(facts, destinationPath: writer.destinationPath)
         if case .failed = directorySync {
-            if PinnedDestinationDirectory.removePublishedFile(
-                named: writer.filename,
-                relativeTo: writer.parentFD,
-                expected: temporaryInfo
-            ) {
-                facts.publicationSucceeded = false
-                facts.publicationRemovedAfterFailure = true
-                _ = durabilityIO.syncDirectory(fileDescriptor: writer.parentFD)
-                durabilityRecorder?.recordCopyFacts(facts, destinationPath: writer.destinationPath)
-            }
+            facts.publicationInterrupted = true
+            durabilityRecorder?.recordCopyFacts(facts, destinationPath: writer.destinationPath)
             throw fanOutDurabilityError("destination directory fsync", outcome: directorySync)
         }
 
@@ -552,22 +564,6 @@ extension FileCopyService {
         try writer.handle.close()
         writer.closed = true
         durabilityRecorder?.recordCopyFacts(facts, destinationPath: writer.destinationPath)
-    }
-
-    private static func rollbackFanOutPublication(
-        destination: PinnedDestinationFile,
-        destinationPath: String,
-        durabilityIO: any TransferDurabilityIO,
-        durabilityRecorder: (any TransferDurabilityRecorder)?
-    ) {
-        guard var copy = durabilityRecorder?.copyFacts(destinationPath: destinationPath),
-              copy.publicationSucceeded,
-              !copy.reusedExistingDestination,
-              destination.removeNamedFileIfStillThisFile() else { return }
-        copy.publicationSucceeded = false
-        copy.publicationRemovedAfterFailure = true
-        durabilityRecorder?.recordCopyFacts(copy, destinationPath: destinationPath)
-        destination.synchronizeParent(using: durabilityIO)
     }
 
     private static func fanOutRelativeComponents(_ relativePath: String) -> [String]? {
