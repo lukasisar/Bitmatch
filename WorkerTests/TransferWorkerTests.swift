@@ -159,6 +159,8 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(runtime.capabilities().supportedProtocolVersions, [3])
         XCTAssertEqual(runtime.capabilities().supportedVerificationPolicies, ["sha256"])
         XCTAssertEqual(runtime.capabilities().upstreamRevision, TransferWorkerIdentity.upstreamRevision)
+        XCTAssertTrue(runtime.capabilities().capabilities.contains("no-overwrite-publication"))
+        XCTAssertFalse(runtime.capabilities().capabilities.contains("atomic-no-overwrite"))
     }
 
     func testExactResultSetValidatorAcceptsCompleteCartesianProduct() {

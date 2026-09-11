@@ -16,7 +16,6 @@ struct TransferCopyDurabilityFacts: Equatable, Sendable {
     var fullSync: TransferSystemCallOutcome?
     var prePublicationChecksumMatched = false
     var publicationSucceeded = false
-    var publicationRemovedAfterFailure = false
     var publicationInterrupted = false
     var publicationIdentity: PublishedFileIdentity?
     var reusedExistingDestination = false
