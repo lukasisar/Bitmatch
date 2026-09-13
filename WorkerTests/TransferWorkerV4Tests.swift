@@ -64,7 +64,21 @@ final class TransferWorkerV4Tests: XCTestCase {
     }
 
     func testV4PreservesUnicodeAndCaseSensitiveNamesWithoutFolding() async throws {
-        let selected = ["DCIM/café-東京.MOV", "DCIM/Case.MOV", "DCIM/case.MOV"]
+        // Case.MOV/case.MOV are only genuinely distinct files if this run's temp directory
+        // sits on a case-sensitive volume (not the default for a Mac boot/temp volume, this
+        // one included). On a case-insensitive volume the second setUp write silently
+        // overwrote the first, so both paths now name the same physical file with "lower"'s
+        // content: selecting both together is then a real case-insensitive collision within
+        // this job's own selected set, which the safety validator correctly refuses -- not a
+        // folding bug. Only assert the case-distinct pair where the fixture actually made two
+        // distinct files; Unicode preservation is unconditional.
+        let caseAContent = try? Data(contentsOf: source.appendingPathComponent("DCIM/Case.MOV"))
+        let caseBContent = try? Data(contentsOf: source.appendingPathComponent("DCIM/case.MOV"))
+        let caseVariantsAreDistinctOnDisk = caseAContent != nil && caseAContent != caseBContent
+
+        let selected = caseVariantsAreDistinctOnDisk
+            ? ["DCIM/café-東京.MOV", "DCIM/Case.MOV", "DCIM/case.MOV"]
+            : ["DCIM/café-東京.MOV"]
         let result = await TransferWorkerDispatcher().run(
             job: makeJob(version: 4, selected: selected, destinations: [destination("a", destinationA)]),
             evidenceURL: root.appendingPathComponent("unicode.json")
@@ -88,6 +102,43 @@ final class TransferWorkerV4Tests: XCTestCase {
             )
             XCTAssertEqual(result.exitCode, .invalidJob)
             XCTAssertTrue(try recursiveRelativePaths(in: destinationA).isEmpty)
+        }
+    }
+
+    func testV4SelectionUnaffectedByUnrelatedCaseCollisionElsewhereInSourceTree() async throws {
+        // setUpWithError's fixture always contains an unrelated Case.MOV/case.MOV pair. A V4
+        // selection that never references either of them must not be blocked by that: only
+        // collisions among the files actually being read and written are this operation's
+        // concern, not the rest of a large, possibly messy real source root.
+        let result = await TransferWorkerDispatcher().run(
+            job: makeJob(version: 4, selected: ["DCIM/NEW001.MP4"], destinations: [destination("a", destinationA)]),
+            evidenceURL: root.appendingPathComponent("unrelated-collision.json")
+        )
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(Set(try detailPaths(result)), ["DCIM/NEW001.MP4"])
+    }
+
+    func testV4DoesNotMaterializeEmptyDirectoriesForUnselectedPartsOfSourceTree() async throws {
+        // setUpWithError's fixture always contains PRIVATE/M4ROOT/... paths that this
+        // selection never references. Materializing an empty PRIVATE/ (or PRIVATE/M4ROOT/)
+        // directory at the destination for an operation that never selected anything under
+        // it defeats the point of an exact subset, and would surprise anyone diffing the
+        // destination tree against the selected set. Two destinations so this exercises the
+        // fan-out directory-preparation path (FileCopyService.prepareFanOutDirectoryTree),
+        // not just the single/preEnumerated-destination path (createDirectoryTreeSafely) --
+        // they are separate implementations and each needed this fix independently.
+        let result = await TransferWorkerDispatcher().run(
+            job: makeJob(
+                version: 4,
+                selected: ["DCIM/NEW001.MP4"],
+                destinations: [destination("a", destinationA), destination("b", destinationB)]
+            ),
+            evidenceURL: root.appendingPathComponent("no-empty-dirs.json")
+        )
+        XCTAssertEqual(result.exitCode, .success)
+        for destinationURL in [destinationA!, destinationB!] {
+            let destinationEntries = try recursiveRelativePaths(in: destinationURL)
+            XCTAssertFalse(destinationEntries.contains { $0.hasPrefix("PRIVATE") })
         }
     }
 

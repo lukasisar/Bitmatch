@@ -346,6 +346,17 @@ final class SafetyValidator {
     }
 
     static func validateSourceTreeForCopy(source: URL) throws {
+        // A V4 exact-subset job only ever reads and writes its selected files, so only
+        // those paths (and their containing directories, which are themselves written at
+        // the destination) can produce a real case-insensitive collision. Validating the
+        // whole physical source tree here -- as the V3 whole-source path below still does,
+        // unchanged -- would fail closed on collisions among files this operation never
+        // touches, which defeats the point of an exact subset on a large, messy real card.
+        if let exactRelativePaths = FileTreeEnumerator.exactRelativePaths {
+            try validatePortableRelativePaths(Self.pathsAndAncestors(of: exactRelativePaths))
+            return
+        }
+
         let fm = FileManager.default
         let resolver = RelativePathResolver(base: source)
         let keys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .isSymbolicLinkKey]
@@ -370,6 +381,23 @@ final class SafetyValidator {
         }
 
         try validatePortableRelativePaths(relativePaths)
+    }
+
+    /// Every selected file's own relative path plus each of its ancestor directory paths,
+    /// so two selected files under differently-cased same-named directories (e.g.
+    /// `DCIM/Foo/a.mp4` and `DCIM/foo/b.mp4`) are still caught, without re-scanning source
+    /// paths this operation will never read.
+    private static func pathsAndAncestors(of relativePaths: [String]) -> [String] {
+        var result: Set<String> = []
+        for relativePath in relativePaths {
+            result.insert(relativePath)
+            let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+            guard components.count > 1 else { continue }
+            for endIndex in 1..<components.count {
+                result.insert(components[0..<endIndex].joined(separator: "/"))
+            }
+        }
+        return Array(result)
     }
 
     static func validatePortableRelativePaths(_ relativePaths: [String]) throws {
