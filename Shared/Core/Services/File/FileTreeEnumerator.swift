@@ -48,6 +48,12 @@ struct RelativePathResolver: Sendable {
 }
 
 enum FileTreeEnumerator {
+    /// Worker-scoped exact V4 selection. Structured child Tasks inherit this value, so
+    /// the existing hardened copy service and its source-stability recheck see the same
+    /// frozen subset without adding a second copy implementation. GUI/V3 callers never
+    /// bind it and therefore retain whole-source enumeration byte-for-byte.
+    @TaskLocal static var exactRelativePaths: [String]?
+
     /// macOS volume metadata directories written to the root of removable media. They are
     /// not user data and are frequently unreadable without Full Disk Access, so descending
     /// into them would abort the whole transfer with a permission error. Only direct
@@ -65,6 +71,111 @@ enum FileTreeEnumerator {
     /// Pass result to both copy and verify phases to eliminate triple filesystem walk.
     /// ~20 bytes per entry overhead for 100K files ≈ 20MB - acceptable.
     static func enumerateRegularFiles(base: URL) throws -> [FileEntry] {
+        if let exactRelativePaths {
+            return try enumerateExactRegularFiles(base: base, relativePaths: exactRelativePaths)
+        }
+        return try enumerateWholeSource(base: base)
+    }
+
+    /// V4 selection resolves only the explicitly requested source-root-relative files.
+    /// It never builds a staging tree, never follows symlinks, and never reads excluded
+    /// regular-file metadata or bytes. The same path vocabulary is validated again here
+    /// at the filesystem boundary so callers cannot bypass the wire validation helper.
+    private static func enumerateExactRegularFiles(base: URL, relativePaths: [String]) throws -> [FileEntry] {
+        try Task.checkCancellation()
+        if let issue = TransferRelativePathSelection.validationIssue(relativePaths) {
+            throw NSError(
+                domain: "FileTreeEnumerator",
+                code: NSFileReadInvalidFileNameError,
+                userInfo: [NSLocalizedDescriptionKey: issue]
+            )
+        }
+
+        let fileManager = FileManager.default
+        var rootIsDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: base.path, isDirectory: &rootIsDirectory), rootIsDirectory.boolValue else {
+            throw BitMatchError.fileNotFound(base)
+        }
+
+        let canonical = TransferRelativePathSelection.canonicalized(relativePaths)
+        let keys: Set<URLResourceKey> = [
+            .isRegularFileKey,
+            .isDirectoryKey,
+            .isSymbolicLinkKey,
+            .fileSizeKey,
+            .contentModificationDateKey
+        ]
+        var entries: [FileEntry] = []
+        entries.reserveCapacity(canonical.count)
+
+        for relativePath in canonical {
+            try Task.checkCancellation()
+            let components = relativePath.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+            if let first = components.first, skippedVolumeMetadataDirectories.contains(first) {
+                throw NSError(
+                    domain: "FileTreeEnumerator",
+                    code: NSFileReadNoSuchFileError,
+                    userInfo: [NSLocalizedDescriptionKey: "Selected path is inside ignored volume metadata: \(relativePath)"]
+                )
+            }
+
+            var current = base
+            for (index, component) in components.enumerated() {
+                current.appendPathComponent(component, isDirectory: index < components.count - 1)
+                let values: URLResourceValues
+                do {
+                    values = try current.resourceValues(forKeys: keys)
+                } catch {
+                    throw NSError(
+                        domain: "FileTreeEnumerator",
+                        code: (error as NSError).code,
+                        userInfo: [NSLocalizedDescriptionKey: "Selected source file is unavailable: \(relativePath): \(error.localizedDescription)"]
+                    )
+                }
+                guard values.isSymbolicLink != true else {
+                    throw NSError(
+                        domain: "FileTreeEnumerator",
+                        code: NSFileReadInvalidFileNameError,
+                        userInfo: [NSLocalizedDescriptionKey: "Selected source path must not traverse a symlink: \(relativePath)"]
+                    )
+                }
+                if index < components.count - 1 {
+                    guard values.isDirectory == true else {
+                        throw NSError(
+                            domain: "FileTreeEnumerator",
+                            code: NSFileReadNoSuchFileError,
+                            userInfo: [NSLocalizedDescriptionKey: "Selected source parent is not a directory: \(relativePath)"]
+                        )
+                    }
+                } else {
+                    guard values.isRegularFile == true else {
+                        throw NSError(
+                            domain: "FileTreeEnumerator",
+                            code: NSFileReadNoSuchFileError,
+                            userInfo: [NSLocalizedDescriptionKey: "Selected source path is not a regular file: \(relativePath)"]
+                        )
+                    }
+                    entries.append(FileEntry(
+                        url: current,
+                        relativePath: relativePath,
+                        size: Int64(values.fileSize ?? 0),
+                        modificationDate: values.contentModificationDate
+                    ))
+                }
+            }
+        }
+
+        guard entries.count == canonical.count else {
+            throw NSError(
+                domain: "FileTreeEnumerator",
+                code: NSFileReadNoSuchFileError,
+                userInfo: [NSLocalizedDescriptionKey: "Exact source selection could not be resolved completely"]
+            )
+        }
+        return entries
+    }
+
+    private static func enumerateWholeSource(base: URL) throws -> [FileEntry] {
         try Task.checkCancellation()
         let fileManager = FileManager.default
         let resolver = RelativePathResolver(base: base)
