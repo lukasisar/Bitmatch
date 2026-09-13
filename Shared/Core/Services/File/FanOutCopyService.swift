@@ -108,6 +108,23 @@ extension FileCopyService {
         from sourceRoot: URL,
         in destinationRoot: PinnedDestinationDirectory
     ) throws {
+        // Same V4 scoping as FileCopyService.createDirectoryTreeSafely: a fan-out to 2+
+        // destinations still only selected specific files, so only their own ancestor
+        // directories belong at each destination -- not a mirror of the whole source tree,
+        // which would create empty directories for parts of the source this operation
+        // never touches (the fan-out path is a separate implementation from the
+        // single/preEnumerated-destination path, so it needed the identical fix there).
+        if let exactRelativePaths = FileTreeEnumerator.exactRelativePaths {
+            for ancestorDirectory in FileCopyService.ancestorDirectoryPaths(of: exactRelativePaths) {
+                guard let components = fanOutRelativeComponents(ancestorDirectory) else {
+                    throw FileOperationError.unsafeOperation("Invalid destination directory path")
+                }
+                let descriptor = try destinationRoot.openOrCreateDirectory(at: components)
+                _ = Darwin.close(descriptor)
+            }
+            return
+        }
+
         let resolver = RelativePathResolver(base: sourceRoot)
         let keys: Set<URLResourceKey> = [.isDirectoryKey, .isSymbolicLinkKey]
         guard let enumerator = FileManager.default.enumerator(

@@ -77,6 +77,7 @@ let package = Package(
                 "Core/Services/SharedFileOperationsService.swift",
                 "Core/Worker/TransferWorkerProtocol.swift",
                 "Core/Worker/TransferWorkerRuntime.swift",
+                "Core/Worker/TransferWorkerDispatcher.swift",
                 "Core/Worker/StorageTopology.swift",
             ],
             swiftSettings: [.swiftLanguageMode(.v5)]

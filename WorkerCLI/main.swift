@@ -6,11 +6,11 @@ import Foundation
 struct BitMatchTransferWorkerCommand {
     static func main() async {
         let arguments = Array(CommandLine.arguments.dropFirst())
-        let runtime = TransferWorkerRuntime()
+        let dispatcher = TransferWorkerDispatcher()
 
         if arguments == ["capabilities", "--json"] {
             do {
-                let data = try TransferWorkerRuntime.makeEncoder().encode(runtime.capabilities())
+                let data = try TransferWorkerRuntime.makeEncoder().encode(dispatcher.capabilities())
                 FileHandle.standardOutput.write(data)
                 FileHandle.standardOutput.write(Data([0x0A]))
                 Darwin.exit(TransferWorkerExitCode.success.rawValue)
@@ -37,7 +37,7 @@ struct BitMatchTransferWorkerCommand {
             let evidenceURL = URL(fileURLWithPath: arguments[4])
             let jobData = try Data(contentsOf: jobURL)
             let job = try TransferWorkerRuntime.makeDecoder().decode(TransferJobSpec.self, from: jobData)
-            let result = await runtime.run(job: job, evidenceURL: evidenceURL)
+            let result = await dispatcher.run(job: job, evidenceURL: evidenceURL)
             if let diagnostic = result.diagnostic { writeError(diagnostic) }
             Darwin.exit(result.exitCode.rawValue)
         } catch {

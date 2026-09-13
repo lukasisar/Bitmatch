@@ -1387,6 +1387,25 @@ final class FileCopyService {
         onError: @escaping (String, Error) async -> Void
     ) async throws {
         let fm = FileManager.default
+
+        // A V4 exact-subset job must only ever materialize the selected files' own
+        // ancestor directories at the destination -- mirroring the whole physical source
+        // tree here (as the V3 whole-source path below still does, unchanged) would create
+        // empty directories for parts of the source this operation never selected and
+        // never touches, exactly the scope leak SafetyValidator.validateSourceTreeForCopy
+        // had for the same reason.
+        if let exactRelativePaths = FileTreeEnumerator.exactRelativePaths {
+            for ancestorDirectory in Self.ancestorDirectoryPaths(of: exactRelativePaths) {
+                let destinationDirectory = destinationRoot.appendingPathComponent(ancestorDirectory, isDirectory: true)
+                do {
+                    try fm.createDirectory(at: destinationDirectory, withIntermediateDirectories: true, attributes: nil)
+                } catch {
+                    await onError(ancestorDirectory, error)
+                }
+            }
+            return
+        }
+
         let resolver = RelativePathResolver(base: sourceRoot)
         let destinationRootPath = destinationRoot.standardized.resolvingSymlinksInPath().path
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
@@ -1463,6 +1482,29 @@ final class FileCopyService {
         onError: @escaping (String, Error) async -> Void
     ) async throws {
         let fm = FileManager.default
+
+        // Same V4 scoping as the URL-destination overload above: only the selected
+        // files' own ancestor directories, never a mirror of the whole source tree.
+        if let exactRelativePaths = FileTreeEnumerator.exactRelativePaths {
+            for ancestorDirectory in Self.ancestorDirectoryPaths(of: exactRelativePaths) {
+                guard let components = safeRelativeComponents(ancestorDirectory) else {
+                    await onError(ancestorDirectory, NSError(
+                        domain: "FileCopyService",
+                        code: NSFileWriteNoPermissionError,
+                        userInfo: [NSLocalizedDescriptionKey: "Directory path contains traversal component"]
+                    ))
+                    continue
+                }
+                do {
+                    let fd = try pinnedRoot.openOrCreateDirectory(at: components)
+                    _ = Darwin.close(fd)
+                } catch {
+                    await onError(ancestorDirectory, error)
+                }
+            }
+            return
+        }
+
         let resolver = RelativePathResolver(base: sourceRoot)
         let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey]
         guard let enumerator = fm.enumerator(
@@ -1507,6 +1549,22 @@ final class FileCopyService {
         }
     }
     #endif
+
+    /// Every ancestor directory of each selected file's relative path (not the file's own
+    /// path, and not the selection's common root alone -- each intermediate level, so a
+    /// directory with no files of its own directly in it, only a further-nested selected
+    /// file, is still created). Order is unspecified; duplicates are removed.
+    static func ancestorDirectoryPaths(of relativePaths: [String]) -> [String] {
+        var result: Set<String> = []
+        for relativePath in relativePaths {
+            let components = relativePath.split(separator: "/", omittingEmptySubsequences: false)
+            guard components.count > 1 else { continue }
+            for endIndex in 1..<components.count {
+                result.insert(components[0..<endIndex].joined(separator: "/"))
+            }
+        }
+        return Array(result)
+    }
 
     private static func safeRelativeComponents(_ relativePath: String) -> [String]? {
         let components = relativePath.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
