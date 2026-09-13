@@ -118,14 +118,20 @@ final class TransferWorkerV4Tests: XCTestCase {
 
     func testV3WithoutAllowlistStillCopiesWholeSourceAndV3WithAllowlistFailsClosed() async throws {
         let dispatcher = TransferWorkerDispatcher()
+        // The fixture writes Case.MOV and case.MOV as distinct paths, but on a
+        // case-insensitive volume (the default for a Mac boot/temp volume) the second
+        // write collapses onto the first, leaving one fewer file than written. Derive the
+        // expectation from what setUp actually produced on this volume rather than
+        // hardcoding a count that assumes case-sensitivity.
+        let expectedSourceFileCount = try recursiveRegularFilePaths(in: source).count
         let v3 = await dispatcher.run(
             job: makeJob(version: 3, selected: nil, destinations: [destination("a", destinationA)]),
             evidenceURL: root.appendingPathComponent("v3.json")
         )
         XCTAssertEqual(v3.exitCode, .success)
         XCTAssertNil(v3.evidence?.includeRelativePaths)
-        XCTAssertEqual(v3.evidence?.source.fileCount, 7)
-        XCTAssertEqual(Set(try detailPaths(v3)).count, 7)
+        XCTAssertEqual(v3.evidence?.source.fileCount, expectedSourceFileCount)
+        XCTAssertEqual(Set(try detailPaths(v3)).count, expectedSourceFileCount)
 
         let destinationC = root.appendingPathComponent("destination-c", isDirectory: true)
         try FileManager.default.createDirectory(at: destinationC, withIntermediateDirectories: true)
@@ -182,6 +188,20 @@ final class TransferWorkerV4Tests: XCTestCase {
         guard let enumerator = FileManager.default.enumerator(at: base, includingPropertiesForKeys: nil) else { return [] }
         return try enumerator.compactMap { item in
             guard let url = item as? URL else { return nil }
+            return try resolver.resolve(url)
+        }
+    }
+
+    private func recursiveRegularFilePaths(in base: URL) throws -> [String] {
+        let resolver = RelativePathResolver(base: base)
+        guard let enumerator = FileManager.default.enumerator(
+            at: base,
+            includingPropertiesForKeys: [.isRegularFileKey]
+        ) else { return [] }
+        return try enumerator.compactMap { item in
+            guard let url = item as? URL else { return nil }
+            let isRegularFile = try url.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile ?? false
+            guard isRegularFile else { return nil }
             return try resolver.resolve(url)
         }
     }
