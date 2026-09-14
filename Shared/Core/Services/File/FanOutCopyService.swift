@@ -157,7 +157,8 @@ extension FileCopyService {
         to targets: [FanOutDestinationTarget],
         durabilityIO: any TransferDurabilityIO,
         durabilityRecorder: (any TransferDurabilityRecorder)?,
-        pauseCheck: (@Sendable () async throws -> Void)? = nil
+        pauseCheck: (@Sendable () async throws -> Void)? = nil,
+        onSourceChunk: ((_ bytesRead: Int64, _ fileSize: Int64) async -> Void)? = nil
     ) async throws -> FanOutFileCopyResult {
         guard let components = fanOutRelativeComponents(relativePath) else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
@@ -251,6 +252,7 @@ extension FileCopyService {
                     writers[index] = nil
                 }
             }
+            await onSourceChunk?(sourceBytesRead, sourceSize)
         }
 
         var sourceFinal = stat()

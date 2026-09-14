@@ -121,6 +121,51 @@ actor ProgressState {
     }
 }
 
+/// Source-oriented telemetry for the V3 single-read fan-out path. Authoritative
+/// result accounting remains destination-oriented in ProgressState; this actor
+/// exists only so one large source file can report bounded, monotonic byte
+/// progress while it is still being read and written.
+actor FanOutLiveProgressState {
+    struct Update {
+        let completedFiles: Int
+        let completedBytes: Int64
+    }
+
+    private var completedFiles = 0
+    private var completedBytes: Int64 = 0
+    private var lastEmission = Date.distantPast
+
+    func observeChunk(
+        bytesReadInFile: Int64,
+        fileSize: Int64,
+        now: Date,
+        throttleInterval: TimeInterval
+    ) -> Update? {
+        let currentBytes = min(max(0, bytesReadInFile), max(0, fileSize))
+        let isFirstPartialChunk = currentBytes > 0
+            && currentBytes < fileSize
+            && currentBytes <= Int64(FileCopyService.fanOutChunkSize)
+        let isFinalChunk = currentBytes >= fileSize
+        guard isFirstPartialChunk
+                || isFinalChunk
+                || now.timeIntervalSince(lastEmission) >= throttleInterval else {
+            return nil
+        }
+        lastEmission = now
+        let (sum, overflow) = completedBytes.addingReportingOverflow(currentBytes)
+        return Update(
+            completedFiles: completedFiles,
+            completedBytes: overflow ? Int64.max : sum
+        )
+    }
+
+    func completeFile(fileSize: Int64) {
+        completedFiles += 1
+        let (sum, overflow) = completedBytes.addingReportingOverflow(max(0, fileSize))
+        completedBytes = overflow ? Int64.max : sum
+    }
+}
+
 /// Serialized storage for pipelined verification tasks.
 actor VerifyTaskStore {
     private var tasks: [Task<Void, Never>] = []
@@ -929,6 +974,11 @@ class SharedFileOperationsService: FileOperationsService {
             settings: operation.settings
         )
         let pauseState = self.pauseState
+        let liveProgressState = FanOutLiveProgressState()
+        let sourceTotalBytes = operation.estimatedTotalBytes ?? sourceManifest.reduce(Int64(0)) {
+            let (sum, overflow) = $0.addingReportingOverflow(max(0, $1.size))
+            return overflow ? Int64.max : sum
+        }
         var targets: [FanOutDestinationTarget] = []
 
         for (destinationIndex, destinationURL) in operation.destinationURLs.enumerated() {
@@ -990,7 +1040,46 @@ class SharedFileOperationsService: FileOperationsService {
                     to: targets,
                     durabilityIO: durabilityIO,
                     durabilityRecorder: durabilityRecorder,
-                    pauseCheck: { try await pauseState.waitIfPaused() }
+                    pauseCheck: { try await pauseState.waitIfPaused() },
+                    onSourceChunk: { bytesRead, fileSize in
+                        let now = Date()
+                        guard let update = await liveProgressState.observeChunk(
+                            bytesReadInFile: bytesRead,
+                            fileSize: fileSize,
+                            now: now,
+                            throttleInterval: 0.5
+                        ) else { return }
+                        let elapsed = now.timeIntervalSince(startTime)
+                        let speed = elapsed > 0 ? Double(update.completedBytes) / elapsed : nil
+                        let remaining: TimeInterval?
+                        if let speed, speed > 0, sourceTotalBytes >= update.completedBytes {
+                            remaining = Double(sourceTotalBytes - update.completedBytes) / speed
+                        } else {
+                            remaining = nil
+                        }
+                        let destinationSnapshot = await destinationProgress.snapshot()
+                        let byteFraction = sourceTotalBytes > 0
+                            ? Double(update.completedBytes) / Double(sourceTotalBytes)
+                            : 0
+                        progressCallback(OperationProgress(
+                            overallProgress: min(1, max(0, byteFraction)),
+                            currentFile: entry.relativePath,
+                            filesProcessed: update.completedFiles,
+                            totalFiles: totalFiles,
+                            currentStage: .copying,
+                            speed: speed,
+                            timeRemaining: remaining,
+                            elapsedTime: elapsed,
+                            averageSpeed: speed,
+                            peakSpeed: nil,
+                            bytesProcessed: update.completedBytes,
+                            totalBytes: sourceTotalBytes,
+                            stageProgress: min(1, max(0, byteFraction)),
+                            reusedCopies: nil,
+                            perDestinationTotals: destinationSnapshot.totals,
+                            perDestinationCompleted: destinationSnapshot.completed
+                        ))
+                    }
                 )
             } catch is CancellationError {
                 throw CancellationError()
@@ -1012,28 +1101,22 @@ class SharedFileOperationsService: FileOperationsService {
                 }
                 continue
             }
+            await liveProgressState.completeFile(fileSize: entry.size)
 
             for target in targets {
                 guard let destinationCopy = copied.destinations.first(where: {
                     $0.destinationIndex == target.index
                 }) else { continue }
                 let destinationURL = destinationCopy.destinationURL
-                let copyUpdate: ProgressState.CopyUpdate
                 if destinationCopy.success {
-                    copyUpdate = await progressState.recordCopy(
+                    _ = await progressState.recordCopy(
                         fileSize: entry.size,
                         totalFiles: totalFiles,
                         now: Date(),
                         throttleInterval: 0.5
                     )
                 } else {
-                    let snapshot = await progressState.recordCopyError()
-                    copyUpdate = ProgressState.CopyUpdate(
-                        processedFiles: snapshot.processedFiles,
-                        totalBytesProcessed: snapshot.totalBytesProcessed,
-                        shouldEmitProgress: false,
-                        shouldLog: false
-                    )
+                    _ = await progressState.recordCopyError()
                 }
                 await destinationProgress.increment(destIndex: target.index)
 
@@ -1105,33 +1188,10 @@ class SharedFileOperationsService: FileOperationsService {
                     await onFileResult?(failure)
                 }
 
-                if copyUpdate.shouldEmitProgress {
-                    let elapsed = Date().timeIntervalSince(startTime)
-                    let speed = elapsed > 0 ? Double(copyUpdate.totalBytesProcessed) / elapsed : nil
-                    let snapshot = await destinationProgress.snapshot()
-                    progressCallback(OperationProgress(
-                        overallProgress: Double(copyUpdate.processedFiles) / Double(max(1, totalFiles * totalStageUnits)),
-                        currentFile: entry.relativePath,
-                        filesProcessed: copyUpdate.processedFiles,
-                        totalFiles: totalFiles,
-                        currentStage: .copying,
-                        speed: speed,
-                        timeRemaining: nil,
-                        elapsedTime: elapsed,
-                        averageSpeed: speed,
-                        peakSpeed: nil,
-                        bytesProcessed: copyUpdate.totalBytesProcessed,
-                        totalBytes: operation.estimatedTotalBytes,
-                        stageProgress: nil,
-                        reusedCopies: nil,
-                        perDestinationTotals: snapshot.totals,
-                        perDestinationCompleted: snapshot.completed
-                    ))
-                }
             }
         }
 
-        let finalMetrics = await progressState.snapshot()
+        let finalDestinationProgress = await destinationProgress.snapshot()
         progressCallback(OperationProgress(
             overallProgress: 1,
             currentFile: nil,
@@ -1143,9 +1203,11 @@ class SharedFileOperationsService: FileOperationsService {
             elapsedTime: Date().timeIntervalSince(startTime),
             averageSpeed: nil,
             peakSpeed: nil,
-            bytesProcessed: finalMetrics.totalBytesProcessed,
-            totalBytes: operation.estimatedTotalBytes,
-            stageProgress: 1
+            bytesProcessed: sourceTotalBytes,
+            totalBytes: sourceTotalBytes,
+            stageProgress: 1,
+            perDestinationTotals: finalDestinationProgress.totals,
+            perDestinationCompleted: finalDestinationProgress.completed
         ))
 
         return FileOperation(

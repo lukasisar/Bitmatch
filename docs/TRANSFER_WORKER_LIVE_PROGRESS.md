@@ -34,7 +34,7 @@ Each line is an independent JSON object with `schemaVersion: 1` and a strictly i
 - optional `currentFile`;
 - optional `elapsedSeconds`, `bytesPerSecond`, and `approximateRemainingSeconds`.
 
-The sidecar maps values from the existing `OperationProgress` objects produced by `SharedFileOperationsService`. Heartbeats repeat the last observed counters; they advance `observedAt` but preserve `lastProgressAt`, so a responsive worker cannot be mistaken for forward copy progress.
+The sidecar maps values from the existing `OperationProgress` objects produced by `SharedFileOperationsService`. The protocol v3 single-source-read fan-out emits source-oriented byte observations from its bounded 4 MiB chunk loop, including an initial partial-file observation, so a large file advances before its terminal file result. The observation is once per source byte rather than multiplied by destination count; destination result/evidence accounting remains unchanged. Heartbeats repeat the last observed counters; they advance `observedAt` but preserve `lastProgressAt`, so a responsive worker cannot be mistaken for forward copy progress.
 
 Throughput and ETA are withheld until there has been enough runtime/progress history to avoid displaying a startup guess as a fact.
 
