@@ -80,6 +80,12 @@ final class LiveProgressObservationTests: XCTestCase {
         XCTAssertNotNil(intermediate)
         XCTAssertEqual(intermediate?.currentFile, "large.bin")
         XCTAssertEqual(intermediate?.totalBytes, Int64(byteCount))
+        let verification = recorder.all.first {
+            $0.currentStage == .verifying && $0.currentFile == "large.bin"
+        }
+        XCTAssertNotNil(verification)
+        XCTAssertEqual(verification?.bytesProcessed, Int64(byteCount))
+        XCTAssertEqual(verification?.totalBytes, Int64(byteCount))
     }
 }
 
