@@ -6,6 +6,9 @@ import Foundation
 /// no-clobber publication, durability and topology code paths.
 public struct TransferWorkerDispatcher {
     public static let exactSubsetCapability = "exact-relative-path-subset-v4"
+    /// Observational only. `--progress` writes lossy JSONL telemetry and is never
+    /// transfer evidence or completion authority.
+    public static let liveProgressCapability = "live-progress-jsonl-v1"
 
     private let runtime: TransferWorkerRuntime
 
@@ -26,7 +29,7 @@ public struct TransferWorkerDispatcher {
             maximumDestinations: legacy.maximumDestinations,
             pauseResume: legacy.pauseResume,
             sourceReadOnly: legacy.sourceReadOnly,
-            capabilities: Array(Set(legacy.capabilities + [Self.exactSubsetCapability])).sorted()
+            capabilities: Array(Set(legacy.capabilities + [Self.exactSubsetCapability, Self.liveProgressCapability])).sorted()
         )
     }
 
@@ -92,9 +95,11 @@ public struct TransferWorkerDispatcher {
         }
 
         // The legacy runtime already validates all of its own mandatory capabilities.
-        // Exact-subset support is implemented by this dispatcher, so remove only that
-        // one dispatcher-owned marker before delegating.
-        let delegatedCapabilities = job.requestedCapabilities.filter { $0.name != Self.exactSubsetCapability }
+        // Exact-subset support and live progress are dispatcher/CLI-owned markers, so
+        // remove only those before delegating to the unchanged transfer runtime.
+        let delegatedCapabilities = job.requestedCapabilities.filter {
+            $0.name != Self.exactSubsetCapability && $0.name != Self.liveProgressCapability
+        }
         let delegatedJob = TransferJobSpec(
             protocolVersion: 4,
             jobID: job.jobID,

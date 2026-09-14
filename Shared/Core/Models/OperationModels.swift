@@ -13,38 +13,38 @@ enum OperationState: Equatable {
     case completed(OperationCompletionInfo)
     case failed
     case cancelled
-    
+
     var isActive: Bool {
         switch self {
         case .inProgress, .copying, .verifying, .resuming: return true
         default: return false
         }
     }
-    
+
     var isPaused: Bool {
         if case .paused = self { return true }
         return false
     }
-    
+
     var canPause: Bool {
         switch self {
         case .inProgress, .copying, .verifying: return true
         default: return false
         }
     }
-    
+
     var canResume: Bool {
         if case .paused = self { return true }
         return false
     }
-    
+
     var canCancel: Bool {
         switch self {
         case .inProgress, .copying, .verifying, .paused, .resuming: return true
         default: return false
         }
     }
-    
+
     var displayName: String {
         switch self {
         case .idle: return "Ready"
@@ -68,7 +68,7 @@ struct PauseInfo: Codable, Equatable {
     let totalFiles: Int
     let bytesProcessed: Int64
     let reason: PauseReason
-    
+
     enum PauseReason: Codable, Equatable {
         case userRequested
         case systemSleep
@@ -90,12 +90,12 @@ enum CompletionState: Equatable {
     case success(message: String)
     case issues(message: String)
     case failed(message: String)
-    
+
     var isActive: Bool {
         if case .inProgress = self { return true }
         return false
     }
-    
+
     var isComplete: Bool {
         switch self {
         case .success, .issues, .failed: return true
@@ -105,15 +105,15 @@ enum CompletionState: Equatable {
 }
 
 // MARK: - Progress Stage
-enum ProgressStage: Codable {
+public enum ProgressStage: Codable, Sendable {
     case idle
     case preparing
     case copying
     case verifying
     case generating
     case completed
-    
-    var displayName: String {
+
+    public var displayName: String {
         switch self {
         case .idle: return "Ready"
         case .preparing: return "Preparing..."
@@ -125,55 +125,63 @@ enum ProgressStage: Codable {
     }
 }
 
+/// A task-local observation seam for clients that need live transfer telemetry.
+///
+/// This is intentionally outside transfer authority: observers can be absent, lossy,
+/// slow, or fail without changing copy, verification, evidence, or terminal status.
+public enum OperationProgressObservation {
+    @TaskLocal public static var sink: (@Sendable (OperationProgress) -> Void)?
+}
+
 // MARK: - Operation Progress
-struct OperationProgress: Codable {
-    let overallProgress: Double
-    let currentFile: String?
-    let filesProcessed: Int
-    let totalFiles: Int
-    let currentStage: ProgressStage
-    let speed: Double? // bytes per second
-    let timeRemaining: TimeInterval?
-    let reusedCopies: Int?
-    
+public struct OperationProgress: Codable, Sendable {
+    public let overallProgress: Double
+    public let currentFile: String?
+    public let filesProcessed: Int
+    public let totalFiles: Int
+    public let currentStage: ProgressStage
+    public let speed: Double? // bytes per second
+    public let timeRemaining: TimeInterval?
+    public let reusedCopies: Int?
+
     // Enhanced timing information
-    let elapsedTime: TimeInterval?
-    let averageSpeed: Double?
-    let peakSpeed: Double?
-    let bytesProcessed: Int64?
-    let totalBytes: Int64?
-    let stageProgress: Double? // Progress within current stage
+    public let elapsedTime: TimeInterval?
+    public let averageSpeed: Double?
+    public let peakSpeed: Double?
+    public let bytesProcessed: Int64?
+    public let totalBytes: Int64?
+    public let stageProgress: Double? // Progress within current stage
     // Per-destination progress (optional)
-    let perDestinationTotals: [Int]?
-    let perDestinationCompleted: [Int]?
-    
-    var formattedSpeed: String? {
+    public let perDestinationTotals: [Int]?
+    public let perDestinationCompleted: [Int]?
+
+    public var formattedSpeed: String? {
         guard let speed = speed else { return nil }
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: Int64(speed)) + "/s"
     }
-    
-    var formattedAverageSpeed: String? {
+
+    public var formattedAverageSpeed: String? {
         guard let averageSpeed = averageSpeed else { return nil }
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: Int64(averageSpeed)) + "/s"
     }
-    
-    var formattedPeakSpeed: String? {
+
+    public var formattedPeakSpeed: String? {
         guard let peakSpeed = peakSpeed else { return nil }
         let formatter = ByteCountFormatter()
         formatter.countStyle = .file
         return formatter.string(fromByteCount: Int64(peakSpeed)) + "/s"
     }
-    
-    var formattedTimeRemaining: String? {
+
+    public var formattedTimeRemaining: String? {
         guard let timeRemaining = timeRemaining else { return nil }
         let hours = Int(timeRemaining / 3600)
         let minutes = Int((timeRemaining.truncatingRemainder(dividingBy: 3600)) / 60)
         let seconds = Int(timeRemaining.truncatingRemainder(dividingBy: 60))
-        
+
         if hours > 0 {
             return "\(hours)h \(minutes)m \(seconds)s"
         } else if minutes > 0 {
@@ -182,13 +190,13 @@ struct OperationProgress: Codable {
             return "\(seconds)s"
         }
     }
-    
-    var formattedElapsedTime: String? {
+
+    public var formattedElapsedTime: String? {
         guard let elapsedTime = elapsedTime else { return nil }
         let hours = Int(elapsedTime / 3600)
         let minutes = Int((elapsedTime.truncatingRemainder(dividingBy: 3600)) / 60)
         let seconds = Int(elapsedTime.truncatingRemainder(dividingBy: 60))
-        
+
         if hours > 0 {
             return "\(hours)h \(minutes)m \(seconds)s"
         } else if minutes > 0 {
@@ -197,19 +205,19 @@ struct OperationProgress: Codable {
             return "\(seconds)s"
         }
     }
-    
-    var formattedBytesProcessed: String? {
+
+    public var formattedBytesProcessed: String? {
         guard let bytesProcessed = bytesProcessed else { return nil }
         return ByteCountFormatter.string(fromByteCount: bytesProcessed, countStyle: .file)
     }
-    
-    var formattedTotalBytes: String? {
+
+    public var formattedTotalBytes: String? {
         guard let totalBytes = totalBytes else { return nil }
         return ByteCountFormatter.string(fromByteCount: totalBytes, countStyle: .file)
     }
-    
+
     // Convenience initializer for backward compatibility
-    init(overallProgress: Double, currentFile: String?, filesProcessed: Int, totalFiles: Int, currentStage: ProgressStage, speed: Double?, timeRemaining: TimeInterval?, reusedCopies: Int? = nil) {
+    public init(overallProgress: Double, currentFile: String?, filesProcessed: Int, totalFiles: Int, currentStage: ProgressStage, speed: Double?, timeRemaining: TimeInterval?, reusedCopies: Int? = nil) {
         self.overallProgress = overallProgress
         self.currentFile = currentFile
         self.filesProcessed = filesProcessed
@@ -226,10 +234,11 @@ struct OperationProgress: Codable {
         self.stageProgress = nil
         self.perDestinationTotals = nil
         self.perDestinationCompleted = nil
+        OperationProgressObservation.sink?(self)
     }
-    
+
     // Full initializer with timing information
-    init(overallProgress: Double, currentFile: String?, filesProcessed: Int, totalFiles: Int, currentStage: ProgressStage, speed: Double?, timeRemaining: TimeInterval?, elapsedTime: TimeInterval?, averageSpeed: Double?, peakSpeed: Double?, bytesProcessed: Int64?, totalBytes: Int64?, stageProgress: Double? = nil, reusedCopies: Int? = nil, perDestinationTotals: [Int]? = nil, perDestinationCompleted: [Int]? = nil) {
+    public init(overallProgress: Double, currentFile: String?, filesProcessed: Int, totalFiles: Int, currentStage: ProgressStage, speed: Double?, timeRemaining: TimeInterval?, elapsedTime: TimeInterval?, averageSpeed: Double?, peakSpeed: Double?, bytesProcessed: Int64?, totalBytes: Int64?, stageProgress: Double? = nil, reusedCopies: Int? = nil, perDestinationTotals: [Int]? = nil, perDestinationCompleted: [Int]? = nil) {
         self.overallProgress = overallProgress
         self.currentFile = currentFile
         self.filesProcessed = filesProcessed
@@ -246,6 +255,7 @@ struct OperationProgress: Codable {
         self.stageProgress = stageProgress
         self.perDestinationTotals = perDestinationTotals
         self.perDestinationCompleted = perDestinationCompleted
+        OperationProgressObservation.sink?(self)
     }
 }
 

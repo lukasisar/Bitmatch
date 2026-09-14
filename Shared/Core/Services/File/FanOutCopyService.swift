@@ -157,7 +157,9 @@ extension FileCopyService {
         to targets: [FanOutDestinationTarget],
         durabilityIO: any TransferDurabilityIO,
         durabilityRecorder: (any TransferDurabilityRecorder)?,
-        pauseCheck: (@Sendable () async throws -> Void)? = nil
+        pauseCheck: (@Sendable () async throws -> Void)? = nil,
+        onSourceChunk: ((_ bytesRead: Int64, _ fileSize: Int64) async -> Void)? = nil,
+        onVerificationChunk: ((_ bytesRead: Int64, _ fileSize: Int64) async -> Void)? = nil
     ) async throws -> FanOutFileCopyResult {
         guard let components = fanOutRelativeComponents(relativePath) else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
@@ -251,6 +253,7 @@ extension FileCopyService {
                     writers[index] = nil
                 }
             }
+            await onSourceChunk?(sourceBytesRead, sourceSize)
         }
 
         var sourceFinal = stat()
@@ -321,13 +324,14 @@ extension FileCopyService {
         for index in writers.keys.sorted() {
             guard let writer = writers[index], terminal[index] == nil else { continue }
             do {
-                try finalizeFanOutWriter(
+                try await finalizeFanOutWriter(
                     writer,
                     source: sourceInitial,
                     sourceChecksum: sourceChecksum,
                     sourceSize: sourceSize,
                     durabilityIO: durabilityIO,
-                    durabilityRecorder: durabilityRecorder
+                    durabilityRecorder: durabilityRecorder,
+                    onVerificationChunk: onVerificationChunk
                 )
                 terminal[index] = FanOutDestinationCopyResult(
                     destinationIndex: index,
@@ -366,7 +370,8 @@ extension FileCopyService {
         pinnedRoot: PinnedDestinationDirectory,
         relativePath: String,
         durabilityIO: any TransferDurabilityIO,
-        durabilityRecorder: (any TransferDurabilityRecorder)? = nil
+        durabilityRecorder: (any TransferDurabilityRecorder)? = nil,
+        onReadbackChunk: ((_ bytesRead: Int64, _ fileSize: Int64) async -> Void)? = nil
     ) async throws -> VerificationResult {
         guard let components = fanOutRelativeComponents(relativePath) else {
             throw FileOperationError.unsafeOperation("Invalid destination file path")
@@ -444,6 +449,7 @@ extension FileCopyService {
             }
             hasher.update(data: data)
             facts.bytesRead += Int64(data.count)
+            await onReadbackChunk?(facts.bytesRead, expectedSize)
         }
         let trailing = try durabilityIO.readDestination(fileDescriptor: opened.descriptor, maximumCount: 1)
         var final = stat()
@@ -481,8 +487,9 @@ extension FileCopyService {
         sourceChecksum: String,
         sourceSize: Int64,
         durabilityIO: any TransferDurabilityIO,
-        durabilityRecorder: (any TransferDurabilityRecorder)?
-    ) throws {
+        durabilityRecorder: (any TransferDurabilityRecorder)?,
+        onVerificationChunk: ((_ bytesRead: Int64, _ fileSize: Int64) async -> Void)?
+    ) async throws {
         var times = [source.st_mtimespec, source.st_mtimespec]
         guard futimens(writer.temporaryFD, &times) == 0 else {
             throw fanOutPOSIXError("Unable to preserve destination modification date")
@@ -515,6 +522,7 @@ extension FileCopyService {
             }
             temporaryHasher.update(data: data)
             verifiedBytes += Int64(data.count)
+            await onVerificationChunk?(verifiedBytes, sourceSize)
         }
         let temporaryChecksum = temporaryHasher.finalize().map { String(format: "%02x", $0) }.joined()
         guard temporaryChecksum == sourceChecksum else {
