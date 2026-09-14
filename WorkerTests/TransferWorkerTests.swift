@@ -583,6 +583,11 @@ final class TransferWorkerTests: XCTestCase {
         let conflictBytes = Data("different-existing-output".utf8)
         try conflictBytes.write(to: conflict)
         let before = try Data(contentsOf: conflict)
+        let unrelatedTemporary = conflict.deletingLastPathComponent()
+            .appendingPathComponent(".bitmatch.tmp.unrelated")
+        let sourceSize = try Data(contentsOf: source.appendingPathComponent("camera-like-file-1.bin")).count
+        let unrelatedBytes = Data(repeating: 0xA5, count: sourceSize)
+        try unrelatedBytes.write(to: unrelatedTemporary)
 
         let rerun = await TransferWorkerRuntime().run(
             job: makeJob(attemptID: UUID()),
@@ -592,6 +597,38 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(rerun.evidence?.terminalStatus, .completedWithFailures)
         XCTAssertFalse(rerun.evidence?.errors.isEmpty ?? true)
         XCTAssertEqual(try Data(contentsOf: conflict), before)
+        XCTAssertEqual(try Data(contentsOf: unrelatedTemporary), unrelatedBytes)
+    }
+
+    func testRetryRecoversProvenInterruptedFATPublication() async throws {
+        let sourceFile = source.appendingPathComponent("camera-like-file-1.bin")
+        let sourceBytes = try Data(contentsOf: sourceFile)
+        let outputDirectory = destinationA.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+        let finalFile = outputDirectory.appendingPathComponent("camera-like-file-1.bin")
+        let temporaryFile = outputDirectory.appendingPathComponent(".bitmatch.tmp.interrupted-retry")
+        try Data(sourceBytes.prefix(max(1, sourceBytes.count / 2))).write(to: finalFile)
+        try sourceBytes.write(to: temporaryFile)
+        let sourceAttributes = try FileManager.default.attributesOfItem(atPath: sourceFile.path)
+        if let modificationDate = sourceAttributes[.modificationDate] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: modificationDate],
+                ofItemAtPath: temporaryFile.path
+            )
+        }
+
+        let result = await TransferWorkerRuntime().run(
+            job: makeJob(destinations: [
+                DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)
+            ]),
+            evidenceURL: root.appendingPathComponent("interrupted-fat-retry.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(result.evidence?.terminalStatus, .succeeded)
+        XCTAssertEqual(try Data(contentsOf: finalFile), sourceBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
     }
 
     func testFullReadbackIsPerformedForEveryPublishedFile() async throws {
