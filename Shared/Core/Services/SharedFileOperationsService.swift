@@ -192,7 +192,25 @@ actor FanOutLiveProgressState {
         completedBytes = overflow ? Int64.max : sum
         lastStage = nil
     }
+
+    func snapshot() -> Update {
+        Update(completedFiles: completedFiles, completedBytes: completedBytes)
+    }
 }
+
+#if canImport(Darwin)
+private func isUnavailableFanOutEndpointError(_ error: Error) -> Bool {
+    let nsError = error as NSError
+    let message = nsError.localizedDescription.lowercased()
+    if message.contains("device not configured")
+        || message.contains("no such device")
+        || message.contains("stale file handle") {
+        return true
+    }
+    guard nsError.domain == NSPOSIXErrorDomain else { return false }
+    return [ENOENT, ENXIO, ENODEV, ENOTDIR, EIO, ESTALE].contains(Int32(nsError.code))
+}
+#endif
 
 /// Serialized storage for pipelined verification tasks.
 actor VerifyTaskStore {
@@ -1008,6 +1026,8 @@ class SharedFileOperationsService: FileOperationsService {
             return overflow ? Int64.max : sum
         }
         var targets: [FanOutDestinationTarget] = []
+        var terminalTargetErrors: [Int: NSError] = [:]
+        var sourceUnavailableError: NSError?
 
         for (destinationIndex, destinationURL) in operation.destinationURLs.enumerated() {
             do {
@@ -1058,14 +1078,51 @@ class SharedFileOperationsService: FileOperationsService {
         for entry in sourceManifest {
             try Task.checkCancellation()
             try await waitIfPaused()
-            guard !targets.isEmpty else { break }
+
+            for target in targets {
+                guard let error = terminalTargetErrors[target.index] else { continue }
+                let failure = FileOperationResult(
+                    sourceURL: entry.url,
+                    destinationURL: target.root.destinationURL(for: entry.relativePath),
+                    success: false,
+                    error: error,
+                    fileSize: 0,
+                    verificationResult: nil,
+                    processingTime: 0
+                )
+                _ = await progressState.recordCopyError()
+                await destinationProgress.increment(destIndex: target.index)
+                await resultStore.upsert(failure)
+                await onFileResult?(failure)
+            }
+
+            let activeTargets = targets.filter { terminalTargetErrors[$0.index] == nil }
+            guard !activeTargets.isEmpty else { continue }
+            if let sourceUnavailableError {
+                for target in activeTargets {
+                    let failure = FileOperationResult(
+                        sourceURL: entry.url,
+                        destinationURL: target.root.destinationURL(for: entry.relativePath),
+                        success: false,
+                        error: sourceUnavailableError,
+                        fileSize: 0,
+                        verificationResult: nil,
+                        processingTime: 0
+                    )
+                    _ = await progressState.recordCopyError()
+                    await destinationProgress.increment(destIndex: target.index)
+                    await resultStore.upsert(failure)
+                    await onFileResult?(failure)
+                }
+                continue
+            }
 
             let copied: FanOutFileCopyResult
             do {
                 copied = try await FileCopyService.copyFileFanOut(
                     from: entry.url,
                     relativePath: entry.relativePath,
-                    to: targets,
+                    to: activeTargets,
                     durabilityIO: durabilityIO,
                     durabilityRecorder: durabilityRecorder,
                     pauseCheck: { try await pauseState.waitIfPaused() },
@@ -1141,7 +1198,10 @@ class SharedFileOperationsService: FileOperationsService {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
-                for target in targets {
+                if isUnavailableFanOutEndpointError(error) {
+                    sourceUnavailableError = error as NSError
+                }
+                for target in activeTargets {
                     let failure = FileOperationResult(
                         sourceURL: entry.url,
                         destinationURL: target.root.destinationURL(for: entry.relativePath),
@@ -1158,7 +1218,7 @@ class SharedFileOperationsService: FileOperationsService {
                 }
                 continue
             }
-            for target in targets {
+            for target in activeTargets {
                 guard let destinationCopy = copied.destinations.first(where: {
                     $0.destinationIndex == target.index
                 }) else { continue }
@@ -1176,6 +1236,10 @@ class SharedFileOperationsService: FileOperationsService {
                 await destinationProgress.increment(destIndex: target.index)
 
                 guard destinationCopy.success else {
+                    if let error = destinationCopy.error,
+                       isUnavailableFanOutEndpointError(error) {
+                        terminalTargetErrors[target.index] = error as NSError
+                    }
                     let failure = FileOperationResult(
                         sourceURL: entry.url,
                         destinationURL: destinationURL,
@@ -1277,20 +1341,29 @@ class SharedFileOperationsService: FileOperationsService {
         }
 
         let finalDestinationProgress = await destinationProgress.snapshot()
+        let finalLiveProgress = await liveProgressState.snapshot()
+        let finalFraction: Double
+        if sourceTotalBytes > 0 {
+            finalFraction = min(1, max(0, Double(finalLiveProgress.completedBytes) / Double(sourceTotalBytes)))
+        } else if totalFiles > 0 {
+            finalFraction = min(1, max(0, Double(finalLiveProgress.completedFiles) / Double(totalFiles)))
+        } else {
+            finalFraction = 1
+        }
         progressCallback(OperationProgress(
-            overallProgress: 1,
+            overallProgress: finalFraction,
             currentFile: nil,
-            filesProcessed: totalFiles,
+            filesProcessed: finalLiveProgress.completedFiles,
             totalFiles: totalFiles,
             currentStage: .completed,
             speed: nil,
-            timeRemaining: 0,
+            timeRemaining: finalFraction == 1 ? 0 : nil,
             elapsedTime: Date().timeIntervalSince(startTime),
             averageSpeed: nil,
             peakSpeed: nil,
-            bytesProcessed: sourceTotalBytes,
+            bytesProcessed: finalLiveProgress.completedBytes,
             totalBytes: sourceTotalBytes,
-            stageProgress: 1,
+            stageProgress: finalFraction,
             perDestinationTotals: finalDestinationProgress.totals,
             perDestinationCompleted: finalDestinationProgress.completed
         ))

@@ -785,9 +785,10 @@ public struct TransferWorkerRuntime {
                 ) else { return (.failed, 0) }
                 let result = operation.results[index]
                 guard result.fileSize == expected.size else { return (.failed, 0) }
-                let outcome = sourceStableAcrossAttempt
-                    ? fileOutcome(result: result, facts: facts.snapshot(destinationPath: result.destinationURL.path))
-                    : .failed
+                let outcome = fileOutcome(
+                    result: result,
+                    facts: facts.snapshot(destinationPath: result.destinationURL.path)
+                )
                 return (outcome, outcome == .failed ? 0 : expected.size)
             }
             let outcomes = outcomesAndBytes.map(\.0)
@@ -1117,7 +1118,12 @@ private func workerErrorCode(for result: FileOperationResult) -> String {
     }
     if message.contains("appeared during copy") { return "publication-collision" }
     if message.contains("source file changed") { return "source-mutated" }
-    if error?.domain == NSPOSIXErrorDomain, error?.code == Int(ENOENT) { return "destination-disappeared" }
+    if error?.domain == NSPOSIXErrorDomain,
+       [Int(ENOENT), Int(ENXIO), Int(ENODEV), Int(ENOTDIR), Int(EIO), Int(ESTALE)].contains(error?.code ?? 0) {
+        if message.contains("source") { return "source-disappeared" }
+        if message.contains("destination") || message.contains("directory") { return "destination-disappeared" }
+        return "io-endpoint-disappeared"
+    }
     return "io-failure"
 }
 

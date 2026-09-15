@@ -15,6 +15,7 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     var publicationHook: ((String) throws -> Void)?
     var claimedPublicationHook: ((String) throws -> Void)?
     var sourceVerificationHook: ((String) throws -> Void)?
+    var sourceTransferHook: ((String) throws -> Void)?
     var destinationWriteHook: ((String, Int) throws -> Void)?
     var fullSyncObserver: ((Int32) -> Void)?
     private let lock = NSLock()
@@ -51,6 +52,7 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
         try claimedPublicationHook?(destinationPath)
     }
     func prepareForSourceVerification(sourcePath: String) throws { try sourceVerificationHook?(sourcePath) }
+    func prepareForSourceTransfer(sourcePath: String) throws { try sourceTransferHook?(sourcePath) }
     func prepareForDestinationChunkWrite(destinationPath: String, byteCount: Int) throws {
         try destinationWriteHook?(destinationPath, byteCount)
     }
@@ -83,6 +85,23 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
             data[data.startIndex] ^= 0xff
         }
         return data
+    }
+}
+
+private final class TransferProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [OperationProgress] = []
+
+    var latest: OperationProgress? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage.last
+    }
+
+    func record(_ progress: OperationProgress) {
+        lock.lock()
+        storage.append(progress)
+        lock.unlock()
     }
 }
 
@@ -464,6 +483,76 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationB.appendingPathComponent("source/large.bin").path))
         XCTAssertEqual(try digest(source.appendingPathComponent("large.bin")), try digest(destinationA.appendingPathComponent("source/large.bin")))
+    }
+
+    func testSourceDisconnectStopsFurtherReadsAndKeepsProgressBelowComplete() async throws {
+        let io = FaultingDurabilityIO()
+        let recorder = TransferProgressRecorder()
+        var preparedSources = 0
+        io.sourceTransferHook = { _ in
+            preparedSources += 1
+            if preparedSources == 2 {
+                throw NSError(
+                    domain: NSPOSIXErrorDomain,
+                    code: Int(ENXIO),
+                    userInfo: [NSLocalizedDescriptionKey: "Source read failed: Device not configured"]
+                )
+            }
+        }
+        let destinations = [
+            DestinationRequest(requestID: "destination-a", executionRoot: destinationA.path, role: .working),
+        ]
+
+        let result = await OperationProgressObservation.$sink.withValue({ recorder.record($0) }) {
+            await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(destinations: destinations),
+                evidenceURL: root.appendingPathComponent("source-disconnect.json")
+            )
+        }
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(preparedSources, 2)
+        XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
+        XCTAssertEqual(result.evidence?.destinations.first?.successfulFiles, 1)
+        XCTAssertEqual(result.evidence?.destinations.first?.failedFiles, 1)
+        XCTAssertEqual(result.evidence?.destinations.first?.strongFiles, 1)
+        XCTAssertEqual(result.evidence?.destinations.first?.verificationOutcome, .failed)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-disappeared" } == true)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-read-incomplete" } == true)
+        XCTAssertLessThan(recorder.latest?.overallProgress ?? 1, 1)
+        XCTAssertLessThan(recorder.latest?.filesProcessed ?? 2, 2)
+    }
+
+    func testDestinationDisconnectStopsFurtherSourceReadsAndKeepsExactAccounting() async throws {
+        let io = FaultingDurabilityIO()
+        let recorder = TransferProgressRecorder()
+        io.destinationWriteHook = { _, _ in
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(ENXIO),
+                userInfo: [NSLocalizedDescriptionKey: "Destination write failed: Device not configured"]
+            )
+        }
+        let destinations = [
+            DestinationRequest(requestID: "destination-a", executionRoot: destinationA.path, role: .working),
+        ]
+
+        let result = await OperationProgressObservation.$sink.withValue({ recorder.record($0) }) {
+            await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(destinations: destinations),
+                evidenceURL: root.appendingPathComponent("destination-disconnect.json")
+            )
+        }
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
+        XCTAssertEqual(result.evidence?.destinations.first?.successfulFiles, 0)
+        XCTAssertEqual(result.evidence?.destinations.first?.failedFiles, 2)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "destination-disappeared" } == true)
+        XCTAssertEqual(result.evidence?.source.transferReadPasses, 1)
+        XCTAssertLessThan(io.sourceBytesRead, result.evidence?.source.totalBytes ?? 0)
+        XCTAssertLessThan(recorder.latest?.overallProgress ?? 1, 1)
+        XCTAssertLessThan(recorder.latest?.filesProcessed ?? 2, 2)
     }
 
     func testCancellationCleansOnlyWorkerOwnedIncompleteFiles() async throws {
