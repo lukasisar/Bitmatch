@@ -88,6 +88,35 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     }
 }
 
+final class TransferWorkerErrorClassificationTests: XCTestCase {
+    func testActionableFilesystemFailuresHaveStableTypedCodes() {
+        let cases: [(NSError, String)] = [
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC)), "destination-out-of-space"),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EROFS)), "destination-read-only"),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)), "permission-denied"),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM)), "permission-denied"),
+            (NSError(
+                domain: NSCocoaErrorDomain,
+                code: CocoaError.Code.fileWriteUnknown.rawValue,
+                userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))]
+            ), "destination-out-of-space"),
+        ]
+
+        for (error, expected) in cases {
+            let result = FileOperationResult(
+                sourceURL: URL(fileURLWithPath: "/Volumes/CARD/clip.mov"),
+                destinationURL: URL(fileURLWithPath: "/Volumes/BACKUP/clip.mov"),
+                success: false,
+                error: error,
+                fileSize: 1,
+                verificationResult: nil,
+                processingTime: 0
+            )
+            XCTAssertEqual(workerErrorCode(for: result), expected)
+        }
+    }
+}
+
 private final class TransferProgressRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [OperationProgress] = []
