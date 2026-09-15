@@ -180,6 +180,7 @@ extension FileCopyService {
         var writers: [Int: FanOutTemporaryWriter] = [:]
         var terminal: [Int: FanOutDestinationCopyResult] = [:]
         var reused: [Int: FanOutDestinationTarget] = [:]
+        var interruptedPublications: [Int: FanOutDestinationTarget] = [:]
 
         for target in targets {
             let destinationURL = target.root.destinationURL(for: relativePath)
@@ -193,14 +194,17 @@ extension FileCopyService {
                 _ = Darwin.close(parentFD)
                 if exists {
                     let existing = try target.root.openRegularFile(at: components)
-                    guard Int64(try existing.snapshot().st_size) == sourceSize else {
-                        throw NSError(
-                            domain: "FileCopyService",
-                            code: NSFileWriteFileExistsError,
-                            userInfo: [NSLocalizedDescriptionKey: "Existing destination file differs in size; refusing to overwrite it"]
-                        )
+                    if Int64(try existing.snapshot().st_size) == sourceSize {
+                        reused[target.index] = target
+                    } else {
+                        // FAT-family publication first claims the final name and then
+                        // copies an already-verified hidden temporary file into it.
+                        // A disconnect can therefore leave a shorter final file plus
+                        // the complete `.bitmatch.tmp.*` sibling. Defer the decision
+                        // until the source digest is known; recovery below requires
+                        // both an exact temporary checksum and an exact partial prefix.
+                        interruptedPublications[target.index] = target
                     }
-                    reused[target.index] = target
                 } else {
                     writers[target.index] = try FanOutTemporaryWriter(
                         target: target,
@@ -304,6 +308,39 @@ extension FileCopyService {
             ),
             sourcePath: source.path
         )
+
+        for (index, target) in interruptedPublications {
+            let destinationURL = target.root.destinationURL(for: relativePath)
+            do {
+                let parentFD = try target.root.openOrCreateDirectory(at: Array(components.dropLast()))
+                defer { _ = Darwin.close(parentFD) }
+                let recovered = try recoverInterruptedFATPublication(
+                    finalName: components[components.count - 1],
+                    relativeTo: parentFD,
+                    destinationPath: destinationURL.path,
+                    sourceChecksum: sourceChecksum,
+                    sourceSize: sourceSize,
+                    durabilityIO: durabilityIO
+                )
+                guard recovered else {
+                    throw NSError(
+                        domain: "FileCopyService",
+                        code: NSFileWriteFileExistsError,
+                        userInfo: [NSLocalizedDescriptionKey: "Existing destination file differs in size; refusing to overwrite it"]
+                    )
+                }
+                reused[index] = target
+            } catch {
+                terminal[index] = FanOutDestinationCopyResult(
+                    destinationIndex: index,
+                    destinationURL: destinationURL,
+                    success: false,
+                    error: error,
+                    fileSize: 0
+                )
+            }
+        }
+
         for (index, target) in reused {
             durabilityRecorder?.recordCopyFacts(
                 TransferCopyDurabilityFacts(
@@ -638,7 +675,200 @@ extension FileCopyService {
             domain: "BitMatchTransferWorker.Durability",
             code: Int(details.0),
             userInfo: [NSLocalizedDescriptionKey: "\(operation) failed: \(details.1)"]
-        )
+            )
+        }
+    /// Completes the only safely recognizable interrupted FAT-family publication:
+    /// a shorter regular final file whose entire content is a byte prefix of a
+    /// same-directory BitMatch temporary file that independently matches the current
+    /// source SHA-256 and size. No arbitrary conflicting destination is modified.
+    ///
+    /// The complete temporary remains present until the final descriptor is fully
+    /// extended, flushed, and confirmed to still own the destination name. If this
+    /// recovery is itself interrupted, the next retry can prove and resume it again.
+    private static func recoverInterruptedFATPublication(
+        finalName: String,
+        relativeTo parentFD: Int32,
+        destinationPath: String,
+        sourceChecksum: String,
+        sourceSize: Int64,
+        durabilityIO: any TransferDurabilityIO
+    ) throws -> Bool {
+        let finalFD = finalName.withCString {
+            Darwin.openat(parentFD, $0, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+        }
+        guard finalFD >= 0 else { throw fanOutPOSIXError("Unable to open interrupted destination") }
+        defer { _ = Darwin.close(finalFD) }
+
+        var initialFinal = stat()
+        guard fstat(finalFD, &initialFinal) == 0,
+              (initialFinal.st_mode & S_IFMT) == S_IFREG,
+              Int64(initialFinal.st_size) >= 0,
+              Int64(initialFinal.st_size) < sourceSize else {
+            return false
+        }
+        let initialIdentity = PublishedFileIdentity(initialFinal)
+        guard fanOutNameStillIdentifies(
+            initialIdentity,
+            named: finalName,
+            relativeTo: parentFD
+        ) else { return false }
+
+        let parentPath = URL(fileURLWithPath: destinationPath).deletingLastPathComponent().path
+        let temporaryNames = try FileManager.default.contentsOfDirectory(atPath: parentPath)
+            .filter { $0.hasPrefix(".bitmatch.tmp.") }
+            .sorted()
+
+        for temporaryName in temporaryNames {
+            let temporaryFD = temporaryName.withCString {
+                Darwin.openat(parentFD, $0, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            guard temporaryFD >= 0 else { continue }
+            defer { _ = Darwin.close(temporaryFD) }
+
+            var temporaryInfo = stat()
+            guard fstat(temporaryFD, &temporaryInfo) == 0,
+                  (temporaryInfo.st_mode & S_IFMT) == S_IFREG,
+                  Int64(temporaryInfo.st_size) == sourceSize,
+                  try fanOutSHA256(fileDescriptor: temporaryFD, size: sourceSize) == sourceChecksum,
+                  try fanOutPrefixMatches(
+                    partialFD: finalFD,
+                    completeFD: temporaryFD,
+                    byteCount: Int64(initialFinal.st_size)
+                  ) else {
+                continue
+            }
+
+            guard fanOutNameStillIdentifies(
+                initialIdentity,
+                named: finalName,
+                relativeTo: parentFD
+            ) else { throw DestinationPublicationFailure.ownershipLost(identity: initialIdentity) }
+
+            try durabilityIO.prepareForClaimedPublication(destinationPath: destinationPath)
+            try fanOutAppend(
+                from: temporaryFD,
+                to: finalFD,
+                startingAt: Int64(initialFinal.st_size),
+                endingAt: sourceSize
+            )
+
+            var times = [temporaryInfo.st_mtimespec, temporaryInfo.st_mtimespec]
+            guard futimens(finalFD, &times) == 0 else {
+                throw fanOutPOSIXError("Unable to preserve recovered destination modification date")
+            }
+            guard Darwin.fsync(finalFD) == 0 else {
+                throw fanOutPOSIXError("Unable to synchronize recovered destination file")
+            }
+            let fullSync = durabilityIO.fullSync(fileDescriptor: finalFD)
+            if case .failed = fullSync {
+                throw fanOutDurabilityError("recovered destination F_FULLFSYNC", outcome: fullSync)
+            }
+
+            var completedFinal = stat()
+            guard fstat(finalFD, &completedFinal) == 0,
+                  Int64(completedFinal.st_size) == sourceSize else {
+                throw fanOutPOSIXError("Recovered destination size is incomplete")
+            }
+            let completedIdentity = PublishedFileIdentity(completedFinal)
+            guard fanOutNameStillIdentifies(
+                completedIdentity,
+                named: finalName,
+                relativeTo: parentFD
+            ) else { throw DestinationPublicationFailure.ownershipLost(identity: completedIdentity) }
+
+            PinnedDestinationDirectory.removeItem(named: temporaryName, relativeTo: parentFD)
+            let directorySync = durabilityIO.syncDirectory(fileDescriptor: parentFD)
+            if case .failed = directorySync {
+                throw fanOutDurabilityError("recovered destination directory fsync", outcome: directorySync)
+            }
+            return true
+        }
+        return false
+    }
+
+    private static func fanOutSHA256(fileDescriptor: Int32, size: Int64) throws -> String {
+        guard Darwin.lseek(fileDescriptor, 0, SEEK_SET) == 0 else {
+            throw fanOutPOSIXError("Unable to seek preserved temporary file")
+        }
+        var hasher = SHA256()
+        var bytesRead: Int64 = 0
+        while bytesRead < size {
+            let data = try fanOutReadDescriptor(
+                fileDescriptor,
+                maximumCount: Int(min(Int64(1024 * 1024), size - bytesRead))
+            )
+            guard !data.isEmpty else {
+                throw fanOutPOSIXError("Short preserved temporary file")
+            }
+            hasher.update(data: data)
+            bytesRead += Int64(data.count)
+        }
+        return hasher.finalize().map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func fanOutPrefixMatches(
+        partialFD: Int32,
+        completeFD: Int32,
+        byteCount: Int64
+    ) throws -> Bool {
+        guard Darwin.lseek(partialFD, 0, SEEK_SET) == 0,
+              Darwin.lseek(completeFD, 0, SEEK_SET) == 0 else {
+            throw fanOutPOSIXError("Unable to seek interrupted publication evidence")
+        }
+        var compared: Int64 = 0
+        while compared < byteCount {
+            let count = Int(min(Int64(1024 * 1024), byteCount - compared))
+            let partial = try fanOutReadDescriptor(partialFD, maximumCount: count)
+            let complete = try fanOutReadDescriptor(completeFD, maximumCount: count)
+            guard partial.count == count, complete.count == count else { return false }
+            guard partial == complete else { return false }
+            compared += Int64(count)
+        }
+        return true
+    }
+
+    private static func fanOutAppend(
+        from completeFD: Int32,
+        to partialFD: Int32,
+        startingAt offset: Int64,
+        endingAt size: Int64
+    ) throws {
+        guard Darwin.lseek(completeFD, off_t(offset), SEEK_SET) == off_t(offset),
+              Darwin.lseek(partialFD, off_t(offset), SEEK_SET) == off_t(offset) else {
+            throw fanOutPOSIXError("Unable to seek interrupted publication for recovery")
+        }
+        var written = offset
+        while written < size {
+            let data = try fanOutReadDescriptor(
+                completeFD,
+                maximumCount: Int(min(Int64(1024 * 1024), size - written))
+            )
+            guard !data.isEmpty else { throw fanOutPOSIXError("Short recovery source") }
+            try data.withUnsafeBytes { bytes in
+                var position = 0
+                while position < bytes.count {
+                    let count = Darwin.write(
+                        partialFD,
+                        bytes.baseAddress!.advanced(by: position),
+                        bytes.count - position
+                    )
+                    if count < 0, errno == EINTR { continue }
+                    guard count > 0 else { throw fanOutPOSIXError("Unable to extend interrupted destination") }
+                    position += count
+                }
+            }
+            written += Int64(data.count)
+        }
+    }
+
+    private static func fanOutNameStillIdentifies(
+        _ identity: PublishedFileIdentity,
+        named name: String,
+        relativeTo parentFD: Int32
+    ) -> Bool {
+        var info = stat()
+        let status = name.withCString { fstatat(parentFD, $0, &info, AT_SYMLINK_NOFOLLOW) }
+        return status == 0 && (info.st_mode & S_IFMT) == S_IFREG && identity.matches(info)
     }
 }
 #endif

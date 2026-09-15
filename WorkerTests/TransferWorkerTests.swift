@@ -15,6 +15,7 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     var publicationHook: ((String) throws -> Void)?
     var claimedPublicationHook: ((String) throws -> Void)?
     var sourceVerificationHook: ((String) throws -> Void)?
+    var sourceTransferHook: ((String) throws -> Void)?
     var destinationWriteHook: ((String, Int) throws -> Void)?
     var fullSyncObserver: ((Int32) -> Void)?
     private let lock = NSLock()
@@ -51,6 +52,7 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
         try claimedPublicationHook?(destinationPath)
     }
     func prepareForSourceVerification(sourcePath: String) throws { try sourceVerificationHook?(sourcePath) }
+    func prepareForSourceTransfer(sourcePath: String) throws { try sourceTransferHook?(sourcePath) }
     func prepareForDestinationChunkWrite(destinationPath: String, byteCount: Int) throws {
         try destinationWriteHook?(destinationPath, byteCount)
     }
@@ -83,6 +85,23 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
             data[data.startIndex] ^= 0xff
         }
         return data
+    }
+}
+
+private final class TransferProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [OperationProgress] = []
+
+    var latest: OperationProgress? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storage.last
+    }
+
+    func record(_ progress: OperationProgress) {
+        lock.lock()
+        storage.append(progress)
+        lock.unlock()
     }
 }
 
@@ -466,6 +485,76 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(try digest(source.appendingPathComponent("large.bin")), try digest(destinationA.appendingPathComponent("source/large.bin")))
     }
 
+    func testSourceDisconnectStopsFurtherReadsAndKeepsProgressBelowComplete() async throws {
+        let io = FaultingDurabilityIO()
+        let recorder = TransferProgressRecorder()
+        var preparedSources = 0
+        io.sourceTransferHook = { path in
+            preparedSources += 1
+            if preparedSources == 2 {
+                try FileManager.default.moveItem(
+                    at: URL(fileURLWithPath: path),
+                    to: self.root.appendingPathComponent("disconnected-source-file")
+                )
+            }
+        }
+        let destinations = [
+            DestinationRequest(requestID: "destination-a", executionRoot: destinationA.path, role: .working),
+        ]
+
+        let result = await OperationProgressObservation.$sink.withValue({ recorder.record($0) }) {
+            await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(destinations: destinations),
+                evidenceURL: root.appendingPathComponent("source-disconnect.json")
+            )
+        }
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(preparedSources, 2)
+        XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
+        XCTAssertEqual(result.evidence?.destinations.first?.successfulFiles, 1)
+        XCTAssertEqual(result.evidence?.destinations.first?.failedFiles, 1)
+        XCTAssertEqual(result.evidence?.destinations.first?.strongFiles, 1)
+        XCTAssertEqual(result.evidence?.destinations.first?.verificationOutcome, .failed)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-disappeared" } == true)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-read-incomplete" } == true)
+        XCTAssertFalse(result.evidence?.errors.contains { $0.code.hasPrefix("result-set-") } == true)
+        XCTAssertLessThan(recorder.latest?.overallProgress ?? 1, 1)
+        XCTAssertLessThan(recorder.latest?.filesProcessed ?? 2, 2)
+    }
+
+    func testDestinationDisconnectStopsFurtherSourceReadsAndKeepsExactAccounting() async throws {
+        let io = FaultingDurabilityIO()
+        let recorder = TransferProgressRecorder()
+        io.destinationWriteHook = { _, _ in
+            throw NSError(
+                domain: NSPOSIXErrorDomain,
+                code: Int(ENXIO),
+                userInfo: [NSLocalizedDescriptionKey: "Destination write failed: Device not configured"]
+            )
+        }
+        let destinations = [
+            DestinationRequest(requestID: "destination-a", executionRoot: destinationA.path, role: .working),
+        ]
+
+        let result = await OperationProgressObservation.$sink.withValue({ recorder.record($0) }) {
+            await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(destinations: destinations),
+                evidenceURL: root.appendingPathComponent("destination-disconnect.json")
+            )
+        }
+
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
+        XCTAssertEqual(result.evidence?.destinations.first?.successfulFiles, 0)
+        XCTAssertEqual(result.evidence?.destinations.first?.failedFiles, 2)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "destination-disappeared" } == true)
+        XCTAssertEqual(result.evidence?.source.transferReadPasses, 1)
+        XCTAssertLessThan(io.sourceBytesRead, result.evidence?.source.totalBytes ?? 0)
+        XCTAssertLessThan(recorder.latest?.overallProgress ?? 1, 1)
+        XCTAssertLessThan(recorder.latest?.filesProcessed ?? 2, 2)
+    }
+
     func testCancellationCleansOnlyWorkerOwnedIncompleteFiles() async throws {
         try installLargeSyntheticSource(byteCount: 24 * 1024 * 1024)
         let io = FaultingDurabilityIO()
@@ -583,6 +672,11 @@ final class TransferWorkerTests: XCTestCase {
         let conflictBytes = Data("different-existing-output".utf8)
         try conflictBytes.write(to: conflict)
         let before = try Data(contentsOf: conflict)
+        let unrelatedTemporary = conflict.deletingLastPathComponent()
+            .appendingPathComponent(".bitmatch.tmp.unrelated")
+        let sourceSize = try Data(contentsOf: source.appendingPathComponent("camera-like-file-1.bin")).count
+        let unrelatedBytes = Data(repeating: 0xA5, count: sourceSize)
+        try unrelatedBytes.write(to: unrelatedTemporary)
 
         let rerun = await TransferWorkerRuntime().run(
             job: makeJob(attemptID: UUID()),
@@ -592,6 +686,38 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(rerun.evidence?.terminalStatus, .completedWithFailures)
         XCTAssertFalse(rerun.evidence?.errors.isEmpty ?? true)
         XCTAssertEqual(try Data(contentsOf: conflict), before)
+        XCTAssertEqual(try Data(contentsOf: unrelatedTemporary), unrelatedBytes)
+    }
+
+    func testRetryRecoversProvenInterruptedFATPublication() async throws {
+        let sourceFile = source.appendingPathComponent("camera-like-file-1.bin")
+        let sourceBytes = try Data(contentsOf: sourceFile)
+        let outputDirectory = destinationA.appendingPathComponent("source")
+        try FileManager.default.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
+
+        let finalFile = outputDirectory.appendingPathComponent("camera-like-file-1.bin")
+        let temporaryFile = outputDirectory.appendingPathComponent(".bitmatch.tmp.interrupted-retry")
+        try Data(sourceBytes.prefix(max(1, sourceBytes.count / 2))).write(to: finalFile)
+        try sourceBytes.write(to: temporaryFile)
+        let sourceAttributes = try FileManager.default.attributesOfItem(atPath: sourceFile.path)
+        if let modificationDate = sourceAttributes[.modificationDate] {
+            try FileManager.default.setAttributes(
+                [.modificationDate: modificationDate],
+                ofItemAtPath: temporaryFile.path
+            )
+        }
+
+        let result = await TransferWorkerRuntime().run(
+            job: makeJob(destinations: [
+                DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)
+            ]),
+            evidenceURL: root.appendingPathComponent("interrupted-fat-retry.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(result.evidence?.terminalStatus, .succeeded)
+        XCTAssertEqual(try Data(contentsOf: finalFile), sourceBytes)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
     }
 
     func testFullReadbackIsPerformedForEveryPublishedFile() async throws {

@@ -4,6 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+- Recovery: Resume an interrupted exFAT publication only when a preserved BitMatch temporary file matches the current source SHA-256 and the shorter final file is its exact byte prefix; unrelated conflicts remain untouched.
 - Interface: Simplify transfer setup and completion, keep optional controls under Advanced, and show a result for each backup on Mac, iPad, and iPhone.
 - ASC MHL: Create initial ASC MHL 2.0 inventories after SHA-256 verification; validate generated manifests and chains with the official reference tooling. Existing histories are preserved and reported as unsupported, never overwritten or presented as extended.
 - Recovery: Add a persistent local transfer queue, interrupted-attempt recovery, searchable history, and JSON/CSV exports across all three platforms. Queue entries retain independent settings and original folder identities; issues stop the queue.
