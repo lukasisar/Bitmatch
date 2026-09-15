@@ -489,13 +489,12 @@ final class TransferWorkerTests: XCTestCase {
         let io = FaultingDurabilityIO()
         let recorder = TransferProgressRecorder()
         var preparedSources = 0
-        io.sourceTransferHook = { _ in
+        io.sourceTransferHook = { path in
             preparedSources += 1
             if preparedSources == 2 {
-                throw NSError(
-                    domain: NSPOSIXErrorDomain,
-                    code: Int(ENXIO),
-                    userInfo: [NSLocalizedDescriptionKey: "Source read failed: Device not configured"]
+                try FileManager.default.moveItem(
+                    at: URL(fileURLWithPath: path),
+                    to: self.root.appendingPathComponent("disconnected-source-file")
                 )
             }
         }
@@ -519,6 +518,7 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.destinations.first?.verificationOutcome, .failed)
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-disappeared" } == true)
         XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-read-incomplete" } == true)
+        XCTAssertFalse(result.evidence?.errors.contains { $0.code.hasPrefix("result-set-") } == true)
         XCTAssertLessThan(recorder.latest?.overallProgress ?? 1, 1)
         XCTAssertLessThan(recorder.latest?.filesProcessed ?? 2, 2)
     }

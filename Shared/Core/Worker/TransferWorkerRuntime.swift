@@ -384,6 +384,9 @@ public struct TransferWorkerRuntime {
         do {
             try validate(job: job, sourceURL: sourceURL)
             let manifest = try FileTreeEnumerator.enumerateRegularFiles(base: sourceURL)
+            let relativePathsBySourcePath = Dictionary(uniqueKeysWithValues: manifest.map {
+                ($0.url.path, $0.relativePath)
+            })
             let sourceAttemptSnapshot = try captureSourceAttemptSnapshot(manifest)
             let totalBytes = try manifest.reduce(Int64(0)) { partial, entry in
                 let (sum, overflow) = partial.addingReportingOverflow(entry.size)
@@ -447,6 +450,7 @@ public struct TransferWorkerRuntime {
                             result: result,
                             sourceURL: sourceURL,
                             destinations: job.destinations,
+                            relativePathsBySourcePath: relativePathsBySourcePath,
                             facts: durabilityFacts.snapshot(destinationPath: result.destinationURL.path)
                         )
                         let recorded = await writer.append(record)
@@ -480,7 +484,8 @@ public struct TransferWorkerRuntime {
                     destinationRequestIDs: job.destinations.map(\.requestID),
                     observations: operation.results.map { result in
                         WorkerResultObservation(
-                            relativePath: try? sourceResolver.resolve(result.sourceURL),
+                            relativePath: relativePathsBySourcePath[result.sourceURL.path]
+                                ?? (try? sourceResolver.resolve(result.sourceURL)),
                             destinationRequestID: destinationRequestID(
                                 for: result.destinationURL,
                                 destinations: job.destinations
@@ -507,7 +512,12 @@ public struct TransferWorkerRuntime {
                     facts: durabilityFacts,
                     sourceStableAcrossAttempt: sourceStableAcrossAttempt
                 )
-                var errors = makeErrors(operation: operation, job: job, sourceURL: sourceURL)
+                var errors = makeErrors(
+                    operation: operation,
+                    job: job,
+                    sourceURL: sourceURL,
+                    relativePathsBySourcePath: relativePathsBySourcePath
+                )
                 errors.append(contentsOf: resultSetValidation.errors)
                 if !sourceStableAcrossAttempt {
                     errors.append(WorkerTypedError(
@@ -956,14 +966,20 @@ public struct TransferWorkerRuntime {
         return warnings.sorted()
     }
 
-    private func makeErrors(operation: FileOperation, job: TransferJobSpec, sourceURL: URL) -> [WorkerTypedError] {
+    private func makeErrors(
+        operation: FileOperation,
+        job: TransferJobSpec,
+        sourceURL: URL,
+        relativePathsBySourcePath: [String: String]
+    ) -> [WorkerTypedError] {
         operation.results.compactMap { result in
             guard !result.success else { return nil }
             return WorkerTypedError(
                 code: workerErrorCode(for: result),
                 message: result.error?.localizedDescription ?? "Verification failed",
                 destinationRequestID: destinationRequestID(for: result.destinationURL, destinations: job.destinations),
-                relativePath: try? RelativePathResolver(base: sourceURL).resolve(result.sourceURL)
+                relativePath: relativePathsBySourcePath[result.sourceURL.path]
+                    ?? (try? RelativePathResolver(base: sourceURL).resolve(result.sourceURL))
             )
         }
     }
@@ -1021,10 +1037,13 @@ private func makeFileEvidence(
     result: FileOperationResult,
     sourceURL: URL,
     destinations: [DestinationRequest],
+    relativePathsBySourcePath: [String: String],
     facts: WorkerDurabilityFactsCollector.Snapshot
 ) -> FileEvidenceRecord {
     let destinationID = destinationRequestID(for: result.destinationURL, destinations: destinations) ?? "unknown"
-    let relativePath = (try? RelativePathResolver(base: sourceURL).resolve(result.sourceURL)) ?? result.sourceURL.lastPathComponent
+    let relativePath = relativePathsBySourcePath[result.sourceURL.path]
+        ?? (try? RelativePathResolver(base: sourceURL).resolve(result.sourceURL))
+        ?? result.sourceURL.lastPathComponent
     let typedError = result.success ? nil : WorkerTypedError(
         code: workerErrorCode(for: result),
         message: result.error?.localizedDescription ?? "Verification failed",
