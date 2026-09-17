@@ -514,6 +514,42 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(try digest(source.appendingPathComponent("large.bin")), try digest(destinationA.appendingPathComponent("source/large.bin")))
     }
 
+    func testCapacityAndAccessWriteFaultsSurfaceTypedEvidence() async throws {
+        let cases: [(name: String, code: Int32, expected: String)] = [
+            ("out-of-space", ENOSPC, "destination-out-of-space"),
+            ("read-only", EROFS, "destination-read-only"),
+            ("permission", EACCES, "permission-denied"),
+        ]
+
+        for fault in cases {
+            let destination = root.appendingPathComponent("fault-\(fault.name)", isDirectory: true)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            let io = FaultingDurabilityIO()
+            io.destinationWriteHook = { _, _ in
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(fault.code))
+            }
+
+            let result = await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(destinations: [
+                    DestinationRequest(
+                        requestID: "destination-\(fault.name)",
+                        executionRoot: destination.path,
+                        role: .backup
+                    ),
+                ]),
+                evidenceURL: root.appendingPathComponent("fault-\(fault.name).json")
+            )
+
+            XCTAssertEqual(result.exitCode, .completedWithFailures)
+            XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+            XCTAssertEqual(result.evidence?.destinations.first?.verificationOutcome, .failed)
+            XCTAssertTrue(
+                result.evidence?.errors.contains { $0.code == fault.expected } == true,
+                "Expected \(fault.expected) for \(fault.name)"
+            )
+        }
+    }
+
     func testSourceDisconnectStopsFurtherReadsAndKeepsProgressBelowComplete() async throws {
         let io = FaultingDurabilityIO()
         let recorder = TransferProgressRecorder()
