@@ -952,6 +952,73 @@ final class TransferWorkerTests: XCTestCase {
         })
     }
 
+    func testRootFSEventsMetadataChurnIsExcludedFromCopyEvidenceAndFinalStability() async throws {
+        let io = FaultingDurabilityIO()
+        var churned = false
+        io.sourceVerificationHook = { _ in
+            guard !churned else { return }
+            churned = true
+            let fsevents = self.source.appendingPathComponent(".fseventsd", isDirectory: true)
+            try FileManager.default.createDirectory(at: fsevents, withIntermediateDirectories: true)
+            let bookkeeping = fsevents.appendingPathComponent("0000000000000001")
+            try Data("initial-bookkeeping".utf8).write(to: bookkeeping)
+            let handle = try FileHandle(forWritingTo: bookkeeping)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data("-changed-during-transfer".utf8))
+            try handle.close()
+        }
+
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [
+                DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)
+            ]),
+            evidenceURL: root.appendingPathComponent("fsevents-churn.json")
+        )
+
+        XCTAssertTrue(churned)
+        XCTAssertEqual(result.exitCode, .success, result.diagnostic ?? "")
+        XCTAssertEqual(result.evidence?.terminalStatus, .succeeded)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedStrong)
+        XCTAssertEqual(result.evidence?.source.fileCount, 2)
+        XCTAssertEqual(result.evidence?.source.stabilityVerifiedFiles, 2)
+        XCTAssertFalse(result.evidence?.errors.contains { $0.code == "source-mutated" } == true)
+
+        let details = try detailRecords(from: result)
+        XCTAssertEqual(details.count, 2)
+        XCTAssertFalse(details.contains { $0.relativePath == ".fseventsd" || $0.relativePath.hasPrefix(".fseventsd/") })
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destinationA.appendingPathComponent("source/.fseventsd").path
+        ))
+    }
+
+    func testNewEligibleSourceFileDuringTransferStillFailsClosedAsMutation() async throws {
+        let io = FaultingDurabilityIO()
+        var added = false
+        io.sourceVerificationHook = { _ in
+            guard !added else { return }
+            added = true
+            try Data("late-camera-file".utf8).write(
+                to: self.source.appendingPathComponent("late-camera-file.bin")
+            )
+        }
+
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [
+                DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)
+            ]),
+            evidenceURL: root.appendingPathComponent("eligible-source-added.json")
+        )
+
+        XCTAssertTrue(added)
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.terminalStatus, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+        XCTAssertEqual(result.evidence?.source.stabilityVerifiedFiles, 0)
+        XCTAssertEqual(result.evidence?.source.stabilityFailedFiles, 2)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-mutated" } == true)
+        XCTAssertEqual(try detailRecords(from: result).count, 2)
+    }
+
     func testSourceMutationBetweenCopyAndReadbackIsCaught() async throws {
         let io = FaultingDurabilityIO()
         var mutated = false
