@@ -1107,7 +1107,7 @@ private func makeFileEvidence(
     )
 }
 
-private func workerErrorCode(for result: FileOperationResult) -> String {
+func workerErrorCode(for result: FileOperationResult) -> String {
     if result.verificationResult?.matches == false || (result.error == nil && !result.success) {
         return "checksum-mismatch"
     }
@@ -1137,13 +1137,30 @@ private func workerErrorCode(for result: FileOperationResult) -> String {
     }
     if message.contains("appeared during copy") { return "publication-collision" }
     if message.contains("source file changed") { return "source-mutated" }
-    if error?.domain == NSPOSIXErrorDomain,
-       [Int(ENOENT), Int(ENXIO), Int(ENODEV), Int(ENOTDIR), Int(EIO), Int(ESTALE)].contains(error?.code ?? 0) {
+    let posixCode = underlyingPOSIXCode(in: error)
+    if posixCode == Int(ENOSPC) || error?.code == CocoaError.Code.fileWriteOutOfSpace.rawValue {
+        return "destination-out-of-space"
+    }
+    if posixCode == Int(EROFS) || error?.code == CocoaError.Code.fileWriteVolumeReadOnly.rawValue {
+        return "destination-read-only"
+    }
+    if [Int(EACCES), Int(EPERM)].contains(posixCode ?? 0)
+        || [CocoaError.Code.fileReadNoPermission.rawValue, CocoaError.Code.fileWriteNoPermission.rawValue]
+            .contains(error?.code ?? 0) {
+        return "permission-denied"
+    }
+    if [Int(ENOENT), Int(ENXIO), Int(ENODEV), Int(ENOTDIR), Int(EIO), Int(ESTALE)].contains(posixCode ?? 0) {
         if message.contains("source") { return "source-disappeared" }
         if message.contains("destination") || message.contains("directory") { return "destination-disappeared" }
         return "io-endpoint-disappeared"
     }
     return "io-failure"
+}
+
+private func underlyingPOSIXCode(in error: NSError?) -> Int? {
+    guard let error else { return nil }
+    if error.domain == NSPOSIXErrorDomain { return error.code }
+    return underlyingPOSIXCode(in: error.userInfo[NSUnderlyingErrorKey] as? NSError)
 }
 
 private func operationFact(_ outcome: TransferSystemCallOutcome?) -> WorkerOperationFact {

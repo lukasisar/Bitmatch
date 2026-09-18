@@ -66,6 +66,14 @@ To reuse an existing build directory, set `BITMATCH_DERIVED_DATA_PATH` to an abs
 
 Before sharing evidence, review it for local paths, usernames, device identifiers, and private filenames. Keep full raw records privately and publish a redacted copy. Record the revision and whether the working tree contained changes; a revision alone does not identify uncommitted source changes.
 
+## PP-093 deterministic qualification vs physical acceptance
+
+Post Prep PP-093 separates two kinds of evidence on purpose.
+
+The deterministic worker gate is exercised by `WorkerTests/TransferWorkerTests.swift`. It covers phase and failure boundaries that can be reproduced without removable hardware, including source/destination loss, multi-destination isolation, cancellation, destination readback mismatch, short readback, full-sync and directory-sync failure, publication collision/ownership loss, source mutation, FAT-family interrupted publication recovery, and bounded ENOSPC/read-only/permission write failures. Passing those tests proves the worker's state/evidence contract for those injected faults; it does **not** prove cable-pull, bridge firmware, power-loss, sleep/wake, hub, or filesystem-controller behavior.
+
+The final PP-093 physical acceptance remains a separate Post Prep gate. It must pin and record the exact BitMatch revision actually packaged by Post Prep and must state which physical scenarios were run. Never summarize either layer as simply "hardware qualified."
+
 ## Recording and publishing physical results
 
 Use the [hardware report template](HARDWARE_REPORT_TEMPLATE.md) for each configuration and submit it through the repository's **Hardware test report** issue form. Keep outcomes separate for baseline copy, source removal, one-destination removal, sleep, and cancellation. Mark cases you did not run as **Not tested**. A completed transfer without independent destination hashes is **Inconclusive**, not a verified pass.
