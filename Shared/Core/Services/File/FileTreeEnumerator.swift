@@ -59,6 +59,10 @@ enum FileTreeEnumerator {
     /// into them would abort the whole transfer with a permission error. Only direct
     /// children of the source root are skipped; a user folder that happens to share one
     /// of these names deeper in the tree is real data and is kept.
+    ///
+    /// This is a source-selection policy, not a generic hidden-file policy. The worker's
+    /// initial manifest, copy/detail manifest, and final source-stability rescan all use
+    /// this enumerator so the same root-only exclusion applies at every phase.
     static let skippedVolumeMetadataDirectories: Set<String> = [
         ".Spotlight-V100",
         ".fseventsd",
