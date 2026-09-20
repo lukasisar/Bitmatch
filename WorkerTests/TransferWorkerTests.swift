@@ -367,6 +367,7 @@ final class TransferWorkerTests: XCTestCase {
             evidenceURL: root.appendingPathComponent("containment.json")
         )
         XCTAssertEqual(containmentResult.exitCode, .invalidJob)
+        XCTAssertEqual(containmentResult.evidence?.verificationPolicyUsed, "sha256")
         try assertDestinationHasNoOutput(insideSource)
 
         let nested = destinationA.appendingPathComponent("nested", isDirectory: true)
@@ -393,6 +394,26 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(try sourceSnapshot(), before)
         try assertDestinationHasNoOutput(destinationA)
         try assertDestinationHasNoOutput(destinationB)
+    }
+
+    func testPreflightCapacityFailureNamesDestination() throws {
+        let destination = DestinationRequest(
+            requestID: "destination-short-on-space",
+            executionRoot: destinationB.path,
+            role: .backup
+        )
+        let typed = try XCTUnwrap(TransferWorkerRuntime.typedPreflightError(
+            for: FileOperationError.insufficientSpace(
+                destinationB.path,
+                available: 0.7,
+                required: 2.1
+            ),
+            job: makeJob(destinations: [destination])
+        ))
+
+        XCTAssertEqual(typed.code, "destination-out-of-space")
+        XCTAssertEqual(typed.destinationRequestID, destination.requestID)
+        XCTAssertTrue(typed.message.contains("Insufficient space"))
     }
 
     func testTwoDestinationTransferProducesEvidenceAndDoesNotMutateSource() async throws {

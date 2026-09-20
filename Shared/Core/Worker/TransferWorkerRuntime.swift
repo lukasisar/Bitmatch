@@ -31,10 +31,12 @@ private final class HeadlessFileSystemService: FileSystemService {
 private enum WorkerValidationError: LocalizedError {
     case invalid(String)
     case unsupported(String)
+    case typed(WorkerTypedError)
 
     var errorDescription: String? {
         switch self {
         case .invalid(let message), .unsupported(let message): return message
+        case .typed(let error): return error.message
         }
     }
 }
@@ -418,6 +420,9 @@ public struct TransferWorkerRuntime {
                     sourceSizeBytes: totalBytes
                 )
             } catch {
+                if let typedError = Self.typedPreflightError(for: error, job: job) {
+                    throw WorkerValidationError.typed(typedError)
+                }
                 throw WorkerValidationError.invalid(error.localizedDescription)
             }
 
@@ -593,13 +598,21 @@ public struct TransferWorkerRuntime {
             return writePreflightEvidence(
                 job: job, evidenceURL: evidenceURL, startedAt: startedAt,
                 status: .unsupportedProtocolOrCapability, exitCode: .unsupportedProtocolOrCapability,
-                code: "unsupported", message: message, source: sourceSummary, destinations: summaries
+                error: WorkerTypedError(code: "unsupported", message: message),
+                source: sourceSummary, destinations: summaries
             )
         } catch WorkerValidationError.invalid(let message) {
             return writePreflightEvidence(
                 job: job, evidenceURL: evidenceURL, startedAt: startedAt,
                 status: .invalidJob, exitCode: .invalidJob,
-                code: "invalid-job", message: message, source: sourceSummary, destinations: summaries
+                error: WorkerTypedError(code: "invalid-job", message: message),
+                source: sourceSummary, destinations: summaries
+            )
+        } catch WorkerValidationError.typed(let error) {
+            return writePreflightEvidence(
+                job: job, evidenceURL: evidenceURL, startedAt: startedAt,
+                status: .invalidJob, exitCode: .invalidJob,
+                error: error, source: sourceSummary, destinations: summaries
             )
         } catch {
             return TransferWorkerRunResult(exitCode: .internalFailure, evidence: nil, diagnostic: error.localizedDescription)
@@ -700,28 +713,47 @@ public struct TransferWorkerRuntime {
         startedAt: Date,
         status: TransferTerminalStatus,
         exitCode: TransferWorkerExitCode,
-        code: String,
-        message: String,
+        error typedError: WorkerTypedError,
         source: SourceEvidenceSummary,
         destinations: [DestinationEvidenceSummary]
     ) -> TransferWorkerRunResult {
-        let error = WorkerTypedError(code: code, message: message)
         let evidence = makeEvidence(
             job: job,
             startedAt: startedAt,
             status: status,
             source: source,
             destinations: destinations,
-            verificationPolicyUsed: nil,
+            verificationPolicyUsed: job.verificationPolicy == .sha256 ? "sha256" : nil,
             detailReference: nil,
-            errors: [error]
+            errors: [typedError]
         )
         do {
             try Self.writeEvidenceAtomically(evidence, to: evidenceURL)
-            return TransferWorkerRunResult(exitCode: exitCode, evidence: evidence, diagnostic: message)
-        } catch {
-            return TransferWorkerRunResult(exitCode: exitCode, evidence: nil, diagnostic: "\(message); evidence unavailable: \(error.localizedDescription)")
+            return TransferWorkerRunResult(exitCode: exitCode, evidence: evidence, diagnostic: typedError.message)
+        } catch let writeError {
+            return TransferWorkerRunResult(
+                exitCode: exitCode,
+                evidence: nil,
+                diagnostic: "\(typedError.message); evidence unavailable: \(writeError.localizedDescription)"
+            )
         }
+    }
+
+    static func typedPreflightError(for error: Error, job: TransferJobSpec) -> WorkerTypedError? {
+        guard case .insufficientSpace(let path, _, _) = error as? FileOperationError else {
+            return nil
+        }
+        let canonicalPath = URL(fileURLWithPath: path)
+            .standardizedFileURL.resolvingSymlinksInPath().path
+        let requestID = job.destinations.first {
+            URL(fileURLWithPath: $0.executionRoot)
+                .standardizedFileURL.resolvingSymlinksInPath().path == canonicalPath
+        }?.requestID
+        return WorkerTypedError(
+            code: "destination-out-of-space",
+            message: error.localizedDescription,
+            destinationRequestID: requestID
+        )
     }
 
     private func makeEvidence(
