@@ -781,6 +781,15 @@ final class TransferWorkerTests: XCTestCase {
 
         XCTAssertEqual(result.exitCode, .success)
         XCTAssertEqual(result.evidence?.terminalStatus, .succeeded)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedStrong)
+        let records = try detailRecords(from: result)
+        XCTAssertFalse(records.isEmpty)
+        XCTAssertTrue(records.allSatisfy { record in
+            record.verificationOutcome == .verifiedStrong
+                && record.publication == .published
+                && record.durabilityFlush.status == .succeeded
+                && record.directoryMetadataFlush.status == .succeeded
+        })
         XCTAssertEqual(try Data(contentsOf: finalFile), sourceBytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
     }
