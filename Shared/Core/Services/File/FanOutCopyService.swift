@@ -314,22 +314,31 @@ extension FileCopyService {
             do {
                 let parentFD = try target.root.openOrCreateDirectory(at: Array(components.dropLast()))
                 defer { _ = Darwin.close(parentFD) }
-                let recovered = try recoverInterruptedFATPublication(
+                guard let recoveryFacts = try recoverInterruptedFATPublication(
                     finalName: components[components.count - 1],
                     relativeTo: parentFD,
                     destinationPath: destinationURL.path,
                     sourceChecksum: sourceChecksum,
                     sourceSize: sourceSize,
                     durabilityIO: durabilityIO
-                )
-                guard recovered else {
+                ) else {
                     throw NSError(
                         domain: "FileCopyService",
                         code: NSFileWriteFileExistsError,
                         userInfo: [NSLocalizedDescriptionKey: "Existing destination file differs in size; refusing to overwrite it"]
                     )
                 }
-                reused[index] = target
+                durabilityRecorder?.recordCopyFacts(
+                    recoveryFacts,
+                    destinationPath: destinationURL.path
+                )
+                terminal[index] = FanOutDestinationCopyResult(
+                    destinationIndex: index,
+                    destinationURL: destinationURL,
+                    success: true,
+                    error: nil,
+                    fileSize: sourceSize
+                )
             } catch {
                 terminal[index] = FanOutDestinationCopyResult(
                     destinationIndex: index,
@@ -685,6 +694,9 @@ extension FileCopyService {
     /// The complete temporary remains present until the final descriptor is fully
     /// extended, flushed, and confirmed to still own the destination name. If this
     /// recovery is itself interrupted, the next retry can prove and resume it again.
+    /// A successful recovery returns the current attempt's durability/publication
+    /// facts; it is not classified as a generic reused destination because this
+    /// attempt mutated, synchronized, and revalidated the claimed final inode.
     private static func recoverInterruptedFATPublication(
         finalName: String,
         relativeTo parentFD: Int32,
@@ -692,7 +704,7 @@ extension FileCopyService {
         sourceChecksum: String,
         sourceSize: Int64,
         durabilityIO: any TransferDurabilityIO
-    ) throws -> Bool {
+    ) throws -> TransferCopyDurabilityFacts? {
         let finalFD = finalName.withCString {
             Darwin.openat(parentFD, $0, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
         }
@@ -704,14 +716,14 @@ extension FileCopyService {
               (initialFinal.st_mode & S_IFMT) == S_IFREG,
               Int64(initialFinal.st_size) >= 0,
               Int64(initialFinal.st_size) < sourceSize else {
-            return false
+            return nil
         }
         let initialIdentity = PublishedFileIdentity(initialFinal)
         guard fanOutNameStillIdentifies(
             initialIdentity,
             named: finalName,
             relativeTo: parentFD
-        ) else { return false }
+        ) else { return nil }
 
         let parentPath = URL(fileURLWithPath: destinationPath).deletingLastPathComponent().path
         let temporaryNames = try FileManager.default.contentsOfDirectory(atPath: parentPath)
@@ -781,9 +793,18 @@ extension FileCopyService {
             if case .failed = directorySync {
                 throw fanOutDurabilityError("recovered destination directory fsync", outcome: directorySync)
             }
-            return true
+            return TransferCopyDurabilityFacts(
+                ordinaryFlushSucceeded: true,
+                fullSync: fullSync,
+                prePublicationChecksumMatched: true,
+                publicationSucceeded: true,
+                publicationIdentity: completedIdentity,
+                reusedExistingDestination: false,
+                directorySync: directorySync,
+                sourceRemainedStable: true
+            )
         }
-        return false
+        return nil
     }
 
     private static func fanOutSHA256(fileDescriptor: Int32, size: Int64) throws -> String {

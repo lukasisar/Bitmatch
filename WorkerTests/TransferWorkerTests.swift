@@ -88,6 +88,35 @@ private final class FaultingDurabilityIO: TransferDurabilityIO, @unchecked Senda
     }
 }
 
+final class TransferWorkerErrorClassificationTests: XCTestCase {
+    func testActionableFilesystemFailuresHaveStableTypedCodes() {
+        let cases: [(NSError, String)] = [
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC)), "destination-out-of-space"),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EROFS)), "destination-read-only"),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EACCES)), "permission-denied"),
+            (NSError(domain: NSPOSIXErrorDomain, code: Int(EPERM)), "permission-denied"),
+            (NSError(
+                domain: NSCocoaErrorDomain,
+                code: CocoaError.Code.fileWriteUnknown.rawValue,
+                userInfo: [NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(ENOSPC))]
+            ), "destination-out-of-space"),
+        ]
+
+        for (error, expected) in cases {
+            let result = FileOperationResult(
+                sourceURL: URL(fileURLWithPath: "/Volumes/CARD/clip.mov"),
+                destinationURL: URL(fileURLWithPath: "/Volumes/BACKUP/clip.mov"),
+                success: false,
+                error: error,
+                fileSize: 1,
+                verificationResult: nil,
+                processingTime: 0
+            )
+            XCTAssertEqual(workerErrorCode(for: result), expected)
+        }
+    }
+}
+
 private final class TransferProgressRecorder: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [OperationProgress] = []
@@ -338,6 +367,7 @@ final class TransferWorkerTests: XCTestCase {
             evidenceURL: root.appendingPathComponent("containment.json")
         )
         XCTAssertEqual(containmentResult.exitCode, .invalidJob)
+        XCTAssertEqual(containmentResult.evidence?.verificationPolicyUsed, "sha256")
         try assertDestinationHasNoOutput(insideSource)
 
         let nested = destinationA.appendingPathComponent("nested", isDirectory: true)
@@ -364,6 +394,26 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(try sourceSnapshot(), before)
         try assertDestinationHasNoOutput(destinationA)
         try assertDestinationHasNoOutput(destinationB)
+    }
+
+    func testPreflightCapacityFailureNamesDestination() throws {
+        let destination = DestinationRequest(
+            requestID: "destination-short-on-space",
+            executionRoot: destinationB.path,
+            role: .backup
+        )
+        let typed = try XCTUnwrap(TransferWorkerRuntime.typedPreflightError(
+            for: FileOperationError.insufficientSpace(
+                destinationB.path,
+                available: 0.7,
+                required: 2.1
+            ),
+            job: makeJob(destinations: [destination])
+        ))
+
+        XCTAssertEqual(typed.code, "destination-out-of-space")
+        XCTAssertEqual(typed.destinationRequestID, destination.requestID)
+        XCTAssertTrue(typed.message.contains("Insufficient space"))
     }
 
     func testTwoDestinationTransferProducesEvidenceAndDoesNotMutateSource() async throws {
@@ -483,6 +533,42 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertEqual(result.evidence?.detailEvidence?.recordCount, 2)
         XCTAssertFalse(FileManager.default.fileExists(atPath: destinationB.appendingPathComponent("source/large.bin").path))
         XCTAssertEqual(try digest(source.appendingPathComponent("large.bin")), try digest(destinationA.appendingPathComponent("source/large.bin")))
+    }
+
+    func testCapacityAndAccessWriteFaultsSurfaceTypedEvidence() async throws {
+        let cases: [(name: String, code: Int32, expected: String)] = [
+            ("out-of-space", ENOSPC, "destination-out-of-space"),
+            ("read-only", EROFS, "destination-read-only"),
+            ("permission", EACCES, "permission-denied"),
+        ]
+
+        for fault in cases {
+            let destination = root.appendingPathComponent("fault-\(fault.name)", isDirectory: true)
+            try FileManager.default.createDirectory(at: destination, withIntermediateDirectories: true)
+            let io = FaultingDurabilityIO()
+            io.destinationWriteHook = { _, _ in
+                throw NSError(domain: NSPOSIXErrorDomain, code: Int(fault.code))
+            }
+
+            let result = await TransferWorkerRuntime(durabilityIO: io).run(
+                job: makeJob(destinations: [
+                    DestinationRequest(
+                        requestID: "destination-\(fault.name)",
+                        executionRoot: destination.path,
+                        role: .backup
+                    ),
+                ]),
+                evidenceURL: root.appendingPathComponent("fault-\(fault.name).json")
+            )
+
+            XCTAssertEqual(result.exitCode, .completedWithFailures)
+            XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+            XCTAssertEqual(result.evidence?.destinations.first?.verificationOutcome, .failed)
+            XCTAssertTrue(
+                result.evidence?.errors.contains { $0.code == fault.expected } == true,
+                "Expected \(fault.expected) for \(fault.name)"
+            )
+        }
     }
 
     func testSourceDisconnectStopsFurtherReadsAndKeepsProgressBelowComplete() async throws {
@@ -716,6 +802,15 @@ final class TransferWorkerTests: XCTestCase {
 
         XCTAssertEqual(result.exitCode, .success)
         XCTAssertEqual(result.evidence?.terminalStatus, .succeeded)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedStrong)
+        let records = try detailRecords(from: result)
+        XCTAssertFalse(records.isEmpty)
+        XCTAssertTrue(records.allSatisfy { record in
+            record.verificationOutcome == .verifiedStrong
+                && record.publication == .published
+                && record.durabilityFlush.status == .succeeded
+                && record.directoryMetadataFlush.status == .succeeded
+        })
         XCTAssertEqual(try Data(contentsOf: finalFile), sourceBytes)
         XCTAssertFalse(FileManager.default.fileExists(atPath: temporaryFile.path))
     }
@@ -885,6 +980,73 @@ final class TransferWorkerTests: XCTestCase {
         XCTAssertTrue(try detailRecords(from: result).contains {
             $0.verificationOutcome == .failed && $0.publication == .published
         })
+    }
+
+    func testRootFSEventsMetadataChurnIsExcludedFromCopyEvidenceAndFinalStability() async throws {
+        let io = FaultingDurabilityIO()
+        var churned = false
+        io.sourceVerificationHook = { _ in
+            guard !churned else { return }
+            churned = true
+            let fsevents = self.source.appendingPathComponent(".fseventsd", isDirectory: true)
+            try FileManager.default.createDirectory(at: fsevents, withIntermediateDirectories: true)
+            let bookkeeping = fsevents.appendingPathComponent("0000000000000001")
+            try Data("initial-bookkeeping".utf8).write(to: bookkeeping)
+            let handle = try FileHandle(forWritingTo: bookkeeping)
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data("-changed-during-transfer".utf8))
+            try handle.close()
+        }
+
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [
+                DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)
+            ]),
+            evidenceURL: root.appendingPathComponent("fsevents-churn.json")
+        )
+
+        XCTAssertTrue(churned)
+        XCTAssertEqual(result.exitCode, .success, result.diagnostic ?? "")
+        XCTAssertEqual(result.evidence?.terminalStatus, .succeeded)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .verifiedStrong)
+        XCTAssertEqual(result.evidence?.source.fileCount, 2)
+        XCTAssertEqual(result.evidence?.source.stabilityVerifiedFiles, 2)
+        XCTAssertFalse(result.evidence?.errors.contains { $0.code == "source-mutated" } == true)
+
+        let details = try detailRecords(from: result)
+        XCTAssertEqual(details.count, 2)
+        XCTAssertFalse(details.contains { $0.relativePath == ".fseventsd" || $0.relativePath.hasPrefix(".fseventsd/") })
+        XCTAssertFalse(FileManager.default.fileExists(
+            atPath: destinationA.appendingPathComponent("source/.fseventsd").path
+        ))
+    }
+
+    func testNewEligibleSourceFileDuringTransferStillFailsClosedAsMutation() async throws {
+        let io = FaultingDurabilityIO()
+        var added = false
+        io.sourceVerificationHook = { _ in
+            guard !added else { return }
+            added = true
+            try Data("late-camera-file".utf8).write(
+                to: self.source.appendingPathComponent("late-camera-file.bin")
+            )
+        }
+
+        let result = await TransferWorkerRuntime(durabilityIO: io).run(
+            job: makeJob(destinations: [
+                DestinationRequest(requestID: "a", executionRoot: destinationA.path, role: .backup)
+            ]),
+            evidenceURL: root.appendingPathComponent("eligible-source-added.json")
+        )
+
+        XCTAssertTrue(added)
+        XCTAssertEqual(result.exitCode, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.terminalStatus, .completedWithFailures)
+        XCTAssertEqual(result.evidence?.verificationOutcome, .failed)
+        XCTAssertEqual(result.evidence?.source.stabilityVerifiedFiles, 0)
+        XCTAssertEqual(result.evidence?.source.stabilityFailedFiles, 2)
+        XCTAssertTrue(result.evidence?.errors.contains { $0.code == "source-mutated" } == true)
+        XCTAssertEqual(try detailRecords(from: result).count, 2)
     }
 
     func testSourceMutationBetweenCopyAndReadbackIsCaught() async throws {
