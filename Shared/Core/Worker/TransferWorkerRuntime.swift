@@ -951,7 +951,17 @@ public struct TransferWorkerRuntime {
         }
 
         if copy.reusedExistingDestination {
-            return operationSucceeded(readback.cacheBypass) ? .verifiedDegraded : operationDegraded(readback.cacheBypass) ? .verifiedDegraded : .failed
+            if copy.strengthenedExistingDestination {
+                let required = [copy.fullSync, copy.directorySync, readback.cacheBypass]
+                if required.allSatisfy(operationSucceeded) { return .verifiedStrong }
+                if required.allSatisfy({ operationSucceeded($0) || operationDegraded($0) }) {
+                    return .verifiedDegraded
+                }
+                return .failed
+            }
+            return operationSucceeded(readback.cacheBypass)
+                ? .verifiedDegraded
+                : operationDegraded(readback.cacheBypass) ? .verifiedDegraded : .failed
         }
 
         guard copy.ordinaryFlushSucceeded,
@@ -982,7 +992,8 @@ public struct TransferWorkerRuntime {
         var warnings = Set<String>()
         for result in operation.results where result.success {
             let snapshot = facts.snapshot(destinationPath: result.destinationURL.path)
-            if snapshot.copy?.reusedExistingDestination == true {
+            if snapshot.copy?.reusedExistingDestination == true,
+               snapshot.copy?.strengthenedExistingDestination != true {
                 warnings.insert("A matching pre-existing destination was reused; this attempt cannot attest its original durability flush or publication.")
             }
             if operationDegraded(snapshot.copy?.fullSync) {
@@ -1087,6 +1098,14 @@ private func makeFileEvidence(
     let outcome: WorkerVerificationOutcome
     if !result.success || result.verificationResult?.matches != true {
         outcome = .failed
+    } else if copy.reusedExistingDestination,
+              copy.strengthenedExistingDestination,
+              readback.fullReadPerformed,
+              readback.sourceRemainedStable,
+              operationFact(copy.fullSync).status == .succeeded,
+              operationFact(copy.directorySync).status == .succeeded,
+              operationFact(readback.cacheBypass).status == .succeeded {
+        outcome = .verifiedStrong
     } else if copy.reusedExistingDestination,
               readback.fullReadPerformed,
               readback.sourceRemainedStable,

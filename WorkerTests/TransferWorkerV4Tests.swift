@@ -36,6 +36,135 @@ final class TransferWorkerV4Tests: XCTestCase {
         let capabilities = TransferWorkerDispatcher().capabilities()
         XCTAssertEqual(capabilities.supportedProtocolVersions, [3, 4])
         XCTAssertTrue(capabilities.capabilities.contains(TransferWorkerDispatcher.exactSubsetCapability))
+        XCTAssertTrue(capabilities.capabilities.contains(TransferWorkerDispatcher.attemptLeaseCapability))
+        XCTAssertTrue(capabilities.capabilities.contains(
+            TransferWorkerDispatcher.existingFinalRecoveryCapability
+        ))
+    }
+
+    func testAttemptLeaseAndTemporaryNamesBindToExactJobAndAttempt() throws {
+        let jobID = UUID(uuidString: "11111111-1111-1111-1111-111111111111")!
+        let attemptID = UUID(uuidString: "22222222-2222-2222-2222-222222222222")!
+        let otherAttemptID = UUID(uuidString: "33333333-3333-3333-3333-333333333333")!
+        let leaseURL = root.appendingPathComponent("attempt.lease")
+
+        var lease: TransferWorkerAttemptLease? = try TransferWorkerAttemptLease.acquire(
+            at: leaseURL,
+            jobID: jobID,
+            attemptID: attemptID
+        )
+        XCTAssertEqual(try Data(contentsOf: leaseURL), TransferWorkerAttemptLease.identityData(
+            jobID: jobID,
+            attemptID: attemptID
+        ))
+
+        let temporaryName = TransferWorkerExecutionContext.temporaryFileName(
+            jobID: jobID,
+            attemptID: attemptID,
+            randomID: UUID(uuidString: "44444444-4444-4444-4444-444444444444")!
+        )
+        XCTAssertTrue(TransferWorkerExecutionContext.ownsTemporaryFile(
+            named: temporaryName,
+            jobID: jobID,
+            attemptID: attemptID
+        ))
+        XCTAssertFalse(TransferWorkerExecutionContext.ownsTemporaryFile(
+            named: temporaryName,
+            jobID: jobID,
+            attemptID: otherAttemptID
+        ))
+
+        lease = nil
+        XCTAssertThrowsError(try TransferWorkerAttemptLease.acquire(
+            at: leaseURL,
+            jobID: jobID,
+            attemptID: otherAttemptID
+        )) { error in
+            XCTAssertEqual(error as? TransferWorkerAttemptLeaseError, .identityMismatch)
+        }
+        _ = lease
+    }
+
+    func testV4RequiredAttemptLeaseIsBoundBeforeTheTransferRuns() async throws {
+        let leaseURL = root.appendingPathComponent("v4-attempt.lease")
+        let jobID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let attemptID = UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+        let job = TransferJobSpec(
+            protocolVersion: 4,
+            jobID: jobID,
+            attemptID: attemptID,
+            requestedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sourceRoot: source.path,
+            destinations: [destination("a", destinationA)],
+            verificationPolicy: .sha256,
+            requestedCapabilities: [
+                CapabilityRequest(name: TransferWorkerDispatcher.exactSubsetCapability, required: true),
+                CapabilityRequest(name: TransferWorkerDispatcher.attemptLeaseCapability, required: true),
+            ],
+            attemptLeasePath: leaseURL.path,
+            includeRelativePaths: ["DCIM/NEW001.MP4"]
+        )
+        let result = await TransferWorkerDispatcher().run(
+            job: job,
+            evidenceURL: root.appendingPathComponent("lease-bound.json")
+        )
+
+        XCTAssertEqual(result.exitCode, .success)
+        XCTAssertEqual(
+            try Data(contentsOf: leaseURL),
+            TransferWorkerAttemptLease.identityData(jobID: jobID, attemptID: attemptID)
+        )
+        XCTAssertTrue(result.evidence?.capabilitiesUsed.contains(
+            TransferWorkerDispatcher.attemptLeaseCapability
+        ) == true)
+    }
+
+    func testV4RecoveryCanStrengthenAMatchingExistingFinalWithoutRewritingIt() async throws {
+        let selected = ["DCIM/NEW001.MP4"]
+        let first = await TransferWorkerDispatcher().run(
+            job: makeJob(
+                version: 4,
+                selected: selected,
+                destinations: [destination("a", destinationA)]
+            ),
+            evidenceURL: root.appendingPathComponent("existing-final-first.json")
+        )
+        XCTAssertEqual(first.evidence?.verificationOutcome, .verifiedStrong)
+
+        let final = destinationA.appendingPathComponent("source/DCIM/NEW001.MP4")
+        let originalBytes = try Data(contentsOf: final)
+        let recoveryJob = TransferJobSpec(
+            protocolVersion: 4,
+            jobID: UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!,
+            attemptID: UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!,
+            requestedAt: Date(timeIntervalSince1970: 1_700_000_100),
+            sourceRoot: source.path,
+            destinations: [destination("a", destinationA)],
+            verificationPolicy: .sha256,
+            requestedCapabilities: [
+                CapabilityRequest(name: TransferWorkerDispatcher.exactSubsetCapability, required: true),
+                CapabilityRequest(name: TransferWorkerDispatcher.existingFinalRecoveryCapability, required: true),
+            ],
+            includeRelativePaths: selected
+        )
+        let recovered = await TransferWorkerDispatcher().run(
+            job: recoveryJob,
+            evidenceURL: root.appendingPathComponent("existing-final-recovery.json")
+        )
+
+        XCTAssertEqual(recovered.exitCode, .success)
+        XCTAssertEqual(recovered.evidence?.verificationOutcome, .verifiedStrong)
+        XCTAssertEqual(try Data(contentsOf: final), originalBytes)
+        XCTAssertTrue(recovered.evidence?.capabilitiesUsed.contains(
+            TransferWorkerDispatcher.existingFinalRecoveryCapability
+        ) == true)
+        let records = try detailRecords(recovered)
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records[0].publication, .reusedExisting)
+        XCTAssertEqual(records[0].durabilityFlush.status, .succeeded)
+        XCTAssertEqual(records[0].directoryMetadataFlush.status, .succeeded)
+        XCTAssertTrue(records[0].fullDestinationReadbackPerformed)
+        XCTAssertEqual(records[0].verificationOutcome, .verifiedStrong)
     }
 
     func testV4CanonicalizesSelectionAndCopiesExactlySelectedFiles() async throws {
@@ -225,12 +354,18 @@ final class TransferWorkerV4Tests: XCTestCase {
     }
 
     private func detailPaths(_ result: TransferWorkerRunResult) throws -> [String] {
+        try detailRecords(result).map(\.relativePath)
+    }
+
+    private func detailRecords(_ result: TransferWorkerRunResult) throws -> [FileEvidenceRecord] {
         let path = try XCTUnwrap(result.evidence?.detailEvidence?.path)
         return try String(contentsOfFile: path, encoding: .utf8)
             .split(separator: "\n")
             .map { line in
-                let record = try TransferWorkerRuntime.makeDecoder().decode(FileEvidenceRecord.self, from: Data(line.utf8))
-                return record.relativePath
+                try TransferWorkerRuntime.makeDecoder().decode(
+                    FileEvidenceRecord.self,
+                    from: Data(line.utf8)
+                )
             }
     }
 

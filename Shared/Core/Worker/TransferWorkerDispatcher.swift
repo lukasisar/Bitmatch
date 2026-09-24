@@ -13,6 +13,13 @@ public struct TransferWorkerDispatcher {
     /// Observational only. `--progress` writes lossy JSONL telemetry and is never
     /// transfer evidence or completion authority.
     public static let liveProgressCapability = "live-progress-jsonl-v1"
+    /// Kernel-enforced ownership of one exact job + attempt while the worker may
+    /// mutate destination media. The lease is execution safety, not transfer evidence.
+    public static let attemptLeaseCapability = "attempt-lease-v1"
+    /// Recovery-only capability. A matching existing final may be made strongly
+    /// verifiable by flushing that exact inode + directory and performing the normal
+    /// cold full readback. Its bytes are never rewritten or replaced.
+    public static let existingFinalRecoveryCapability = "existing-final-recovery-v1"
 
     private let runtime: TransferWorkerRuntime
 
@@ -33,13 +40,87 @@ public struct TransferWorkerDispatcher {
             maximumDestinations: legacy.maximumDestinations,
             pauseResume: legacy.pauseResume,
             sourceReadOnly: legacy.sourceReadOnly,
-            capabilities: Array(Set(legacy.capabilities + [Self.exactSubsetCapability, Self.liveProgressCapability])).sorted()
+            capabilities: Array(Set(legacy.capabilities + [
+                Self.exactSubsetCapability,
+                Self.liveProgressCapability,
+                Self.attemptLeaseCapability,
+                Self.existingFinalRecoveryCapability,
+            ])).sorted()
         )
     }
 
     public func run(job: TransferJobSpec, evidenceURL: URL) async -> TransferWorkerRunResult {
+        let leaseRequested = job.requestedCapabilities.contains {
+            $0.required && $0.name == Self.attemptLeaseCapability
+        }
+        let existingFinalRecoveryRequested = job.requestedCapabilities.contains {
+            $0.required && $0.name == Self.existingFinalRecoveryCapability
+        }
+        if existingFinalRecoveryRequested,
+           (job.protocolVersion != 4 || job.destinations.count != 1) {
+            return TransferWorkerRunResult(
+                exitCode: .unsupportedProtocolOrCapability,
+                evidence: nil,
+                diagnostic: "existing-final-recovery-v1 requires one exact-subset V4 destination"
+            )
+        }
+        var attemptLease: TransferWorkerAttemptLease?
+        if leaseRequested {
+            guard let path = job.attemptLeasePath, path.hasPrefix("/") else {
+                return TransferWorkerRunResult(
+                    exitCode: .invalidJob,
+                    evidence: nil,
+                    diagnostic: "attempt-lease-v1 requires an absolute attemptLeasePath"
+                )
+            }
+            do {
+                attemptLease = try TransferWorkerAttemptLease.acquire(
+                    at: URL(fileURLWithPath: path),
+                    jobID: job.jobID,
+                    attemptID: job.attemptID
+                )
+            } catch {
+                return TransferWorkerRunResult(
+                    exitCode: .invalidJob,
+                    evidence: nil,
+                    diagnostic: "Could not acquire attempt lease: \(error.localizedDescription)"
+                )
+            }
+        } else if job.attemptLeasePath != nil {
+            return TransferWorkerRunResult(
+                exitCode: .invalidJob,
+                evidence: nil,
+                diagnostic: "attemptLeasePath was supplied without requiring attempt-lease-v1"
+            )
+        }
+
+        // Keep the lease strongly referenced until after the awaited transfer returns.
+        // A parent-app crash does not affect this worker-owned descriptor.
+        let result = await TransferWorkerExecutionContext.$strengthenReusedExistingDestination.withValue(
+            existingFinalRecoveryRequested
+        ) {
+            await TransferWorkerExecutionContext.$attemptIdentity.withValue(
+                TransferWorkerAttemptIdentity(jobID: job.jobID, attemptID: job.attemptID)
+            ) {
+                await runBound(job: job, evidenceURL: evidenceURL)
+            }
+        }
+        _ = attemptLease
+        return result
+    }
+
+    private func runBound(job: TransferJobSpec, evidenceURL: URL) async -> TransferWorkerRunResult {
         switch job.protocolVersion {
         case 3:
+            guard !job.requestedCapabilities.contains(where: {
+                $0.required && $0.name == Self.existingFinalRecoveryCapability
+            }) else {
+                return TransferWorkerRunResult(
+                    exitCode: .unsupportedProtocolOrCapability,
+                    evidence: nil,
+                    diagnostic: "existing-final-recovery-v1 is supported only for exact-subset protocol V4"
+                )
+            }
             guard job.includeRelativePaths == nil else {
                 return TransferWorkerRunResult(
                     exitCode: .invalidJob,
@@ -47,7 +128,23 @@ public struct TransferWorkerDispatcher {
                     diagnostic: "Protocol V3 must not contain includeRelativePaths; V3 always transfers the complete accepted source root"
                 )
             }
-            return await runtime.run(job: job, evidenceURL: evidenceURL)
+            let delegatedJob = TransferJobSpec(
+                protocolVersion: job.protocolVersion,
+                jobID: job.jobID,
+                attemptID: job.attemptID,
+                requestedAt: job.requestedAt,
+                sourceRoot: job.sourceRoot,
+                destinations: job.destinations,
+                verificationPolicy: job.verificationPolicy,
+                requestedCapabilities: job.requestedCapabilities.filter {
+                    $0.name != Self.attemptLeaseCapability
+                        && $0.name != Self.liveProgressCapability
+                        && $0.name != Self.existingFinalRecoveryCapability
+                },
+                attemptLeasePath: nil,
+                includeRelativePaths: nil
+            )
+            return await runtime.run(job: delegatedJob, evidenceURL: evidenceURL)
 
         case 4:
             guard let selected = job.includeRelativePaths else {
@@ -99,10 +196,13 @@ public struct TransferWorkerDispatcher {
         }
 
         // The legacy runtime already validates all of its own mandatory capabilities.
-        // Exact-subset support and live progress are dispatcher/CLI-owned markers, so
-        // remove only those before delegating to the unchanged transfer runtime.
+        // Exact-subset, live-progress and attempt-lease support are dispatcher/CLI-owned
+        // markers, so remove only those before delegating to the unchanged runtime.
         let delegatedCapabilities = job.requestedCapabilities.filter {
-            $0.name != Self.exactSubsetCapability && $0.name != Self.liveProgressCapability
+            $0.name != Self.exactSubsetCapability
+                && $0.name != Self.liveProgressCapability
+                && $0.name != Self.attemptLeaseCapability
+                && $0.name != Self.existingFinalRecoveryCapability
         }
         let delegatedJob = TransferJobSpec(
             protocolVersion: 4,
@@ -113,6 +213,7 @@ public struct TransferWorkerDispatcher {
             destinations: job.destinations,
             verificationPolicy: job.verificationPolicy,
             requestedCapabilities: delegatedCapabilities,
+            attemptLeasePath: nil,
             includeRelativePaths: canonicalSelection
         )
 
@@ -174,7 +275,14 @@ public struct TransferWorkerDispatcher {
                 errors: delegatedEvidence.errors,
                 capabilitiesUsed: delegatedEvidence.verificationPolicyUsed == nil
                     ? delegatedEvidence.capabilitiesUsed
-                    : Array(Set(delegatedEvidence.capabilitiesUsed + [Self.exactSubsetCapability])).sorted(),
+                    : Array(Set(
+                        delegatedEvidence.capabilitiesUsed
+                            + [Self.exactSubsetCapability]
+                            + (leaseWasRequired(job) ? [Self.attemptLeaseCapability] : [])
+                            + (existingFinalRecoveryWasRequired(job)
+                                ? [Self.existingFinalRecoveryCapability]
+                                : [])
+                    )).sorted(),
                 includeRelativePaths: canonicalSelection
             )
 
@@ -201,6 +309,18 @@ public struct TransferWorkerDispatcher {
         }
     }
 
+    private func leaseWasRequired(_ job: TransferJobSpec) -> Bool {
+        job.requestedCapabilities.contains {
+            $0.required && $0.name == Self.attemptLeaseCapability
+        }
+    }
+
+    private func existingFinalRecoveryWasRequired(_ job: TransferJobSpec) -> Bool {
+        job.requestedCapabilities.contains {
+            $0.required && $0.name == Self.existingFinalRecoveryCapability
+        }
+    }
+
     private func writeEvidenceAtomically(_ evidence: TransferEvidence, to finalURL: URL) throws {
         guard !FileManager.default.fileExists(atPath: finalURL.path) else {
             throw CocoaError(.fileWriteFileExists)
@@ -218,4 +338,5 @@ public struct TransferWorkerDispatcher {
         }
     }
 }
+
 #endif

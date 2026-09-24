@@ -88,3 +88,45 @@ The qualification must prove at minimum:
 - exFAT-safe publication remains correct.
 
 Production promotion requires Lukas's explicit approval of that exact qualified pair.
+
+## Attempt lease and abandoned temporary output
+
+Post Prep may require the additive `attempt-lease-v1` capability. When it does, the
+job supplies an absolute `attemptLeasePath`. The worker acquires an exclusive,
+non-blocking OS file lock for the exact job + attempt before destination media can be
+changed, writes the bound job/attempt identity into that lease file, and holds the lock
+until the worker has finished all destination work. A parent-app crash does not release
+the worker's lock while the worker process is still alive.
+
+Worker-owned media staging files created under that execution are named:
+
+```text
+.bitmatch.tmp.<job-uuid>.<attempt-uuid>.<random-uuid>
+```
+
+The job and attempt components are execution attribution only. Final creator-facing
+filenames and media identity are unchanged. Recovery code may use the exact prefix to
+identify temporary files from one abandoned attempt; it must not treat arbitrary
+`.bitmatch.tmp.*` files as belonging to that attempt.
+
+
+## Recovery of a matching final after an unknown attempt
+
+Post Prep may require the additive `existing-final-recovery-v1` capability together
+with V4 when an earlier leased attempt is known to be abandoned but may already have
+published a final file.
+
+Normal transfers do **not** change behavior: a matching pre-existing file is reused but
+remains degraded because the current attempt cannot attest how its original write was
+made durable.
+
+With `existing-final-recovery-v1`, a checksum-matching existing regular file is not
+rewritten or replaced. Instead the worker reopens that exact pinned inode, requests a
+full file sync, syncs its parent directory, confirms the pathname still identifies the
+same inode, and then performs the normal cache-bypassed full destination readback
+against a stable source read. Only when all of those operations succeed may the new
+attempt report strong verification for the reused final. Unsupported durability/cache
+operations remain degraded; a mismatch or unsafe path remains a failure.
+
+This capability is recovery evidence for the current bytes. It does not rewrite the
+history or claim that the abandoned attempt itself succeeded.

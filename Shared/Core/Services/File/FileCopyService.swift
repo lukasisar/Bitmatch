@@ -19,6 +19,10 @@ struct TransferCopyDurabilityFacts: Equatable, Sendable {
     var publicationInterrupted = false
     var publicationIdentity: PublishedFileIdentity?
     var reusedExistingDestination = false
+    /// True only when an explicitly requested recovery pass reopened a matching
+    /// pre-existing final file, flushed that exact inode, and flushed its parent
+    /// directory without rewriting or replacing the file.
+    var strengthenedExistingDestination = false
     var directorySync: TransferSystemCallOutcome?
     var sourceRemainedStable = false
 }
@@ -760,6 +764,52 @@ final class PinnedDestinationFile: @unchecked Sendable {
             && actual.st_ino == expected.st_ino
     }
 
+    /// Strengthens durability evidence for an already-existing, checksum-matching
+    /// final file without rewriting its bytes. The writable descriptor is opened
+    /// relative to the already-pinned parent and must still identify the same inode.
+    func strengthenDurability(
+        using durabilityIO: any TransferDurabilityIO
+    ) throws -> (fullSync: TransferSystemCallOutcome, directorySync: TransferSystemCallOutcome) {
+        let expected = try snapshot()
+        let flags = O_RDWR | O_NOFOLLOW | O_CLOEXEC
+        let durabilityFD = name.withCString { openat(parentFD, $0, flags) }
+        guard durabilityFD >= 0 else {
+            throw Self.posixError("Unable to open matching destination file for durability recovery")
+        }
+        defer { _ = Darwin.close(durabilityFD) }
+
+        var actual = stat()
+        guard fstat(durabilityFD, &actual) == 0,
+              expected.st_dev == actual.st_dev,
+              expected.st_ino == actual.st_ino else {
+            throw DestinationPublicationFailure.ownershipLost(
+                identity: PublishedFileIdentity(expected)
+            )
+        }
+
+        let fullSync = durabilityIO.fullSync(fileDescriptor: durabilityFD)
+        if case .failed = fullSync {
+            throw TransferDurabilityError.syscall(
+                "existing destination F_FULLFSYNC",
+                outcome: fullSync
+            )
+        }
+        let directorySync = durabilityIO.syncDirectory(fileDescriptor: parentFD)
+        if case .failed = directorySync {
+            throw TransferDurabilityError.syscall(
+                "existing destination directory fsync",
+                outcome: directorySync
+            )
+        }
+        guard nameStillIdentifiesThisFile() else {
+            throw DestinationPublicationFailure.ownershipLost(
+                identity: PublishedFileIdentity(expected),
+                finalNameWasClaimed: false
+            )
+        }
+        return (fullSync, directorySync)
+    }
+
     private static func openRegularFile(named name: String, relativeTo parentFD: Int32) throws -> Int32 {
         let flags = O_RDONLY | O_NOFOLLOW | O_CLOEXEC
         let fd = name.withCString { openat(parentFD, $0, flags) }
@@ -1034,11 +1084,25 @@ final class FileCopyService {
                                     verificationMode: verificationMode,
                                     checksumService: checksumService
                                 ) {
+                                    var facts = TransferCopyDurabilityFacts(
+                                        reusedExistingDestination: true,
+                                        sourceRemainedStable: true
+                                    )
+                                    if TransferWorkerExecutionContext.strengthenReusedExistingDestination {
+                                        guard let durabilityIO else {
+                                            throw FileOperationError.unsafeOperation(
+                                                "Existing-final recovery requires durability verification"
+                                            )
+                                        }
+                                        let strengthened = try destinationFile.strengthenDurability(
+                                            using: durabilityIO
+                                        )
+                                        facts.strengthenedExistingDestination = true
+                                        facts.fullSync = strengthened.fullSync
+                                        facts.directorySync = strengthened.directorySync
+                                    }
                                     durabilityRecorder?.recordCopyFacts(
-                                        TransferCopyDurabilityFacts(
-                                            reusedExistingDestination: true,
-                                            sourceRemainedStable: true
-                                        ),
+                                        facts,
                                         destinationPath: pinnedRoot.destinationURL(for: relativePath).path
                                     )
                                     await onProgress(relativePath, sourceSize)
@@ -1076,7 +1140,7 @@ final class FileCopyService {
         let fm = FileManager.default
         let srcHandle = try FileHandle(forReadingFrom: source)
         defer { closeFileHandle(srcHandle, context: source.path) }
-        let tempName = ".bitmatch.tmp." + UUID().uuidString
+        let tempName = TransferWorkerExecutionContext.makeTemporaryFileName()
         let tempURL = destination.deletingLastPathComponent().appendingPathComponent(tempName)
         // Security 12: set restrictive permissions on temp files
         fm.createFile(atPath: tempURL.path, contents: nil, attributes: [.posixPermissions: 0o600])
@@ -1224,7 +1288,7 @@ final class FileCopyService {
         let sourceHandle = FileHandle(fileDescriptor: sourceFD, closeOnDealloc: false)
         defer { closeFileHandle(sourceHandle, context: source.path) }
 
-        let temporaryName = ".bitmatch.tmp." + UUID().uuidString
+        let temporaryName = TransferWorkerExecutionContext.makeTemporaryFileName()
         let temporaryFD = try PinnedDestinationDirectory.createTemporaryFile(named: temporaryName, relativeTo: parentFD)
         let destinationHandle = FileHandle(fileDescriptor: temporaryFD, closeOnDealloc: false)
         var published = false
