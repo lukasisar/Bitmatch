@@ -1,5 +1,9 @@
 import Foundation
 
+#if os(macOS)
+// This dispatcher executes the headless transfer worker and depends on the
+// macOS-only TransferWorkerRuntime. Wire protocol types stay cross-platform
+// in TransferWorkerProtocol.swift; executable worker behavior does not.
 /// Explicit protocol router. V3 remains the already-qualified whole-source operation.
 /// V4 binds an exact source selection and then executes through the same hardened
 /// TransferWorkerRuntime, SharedFileOperationsService, fan-out, verification,
@@ -214,3 +218,4 @@ public struct TransferWorkerDispatcher {
         }
     }
 }
+#endif
