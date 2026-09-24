@@ -8,17 +8,23 @@ public enum StorageTopologyResolutionStatus: String, Codable, Equatable, Sendabl
 public struct StorageIdentityEvidence: Codable, Equatable, Sendable {
     public let resolutionStatus: StorageTopologyResolutionStatus
     public let physicalLeafIdentifiers: [String]
+    /// Stable server + storage-pool identity for network storage, when a resolver can
+    /// actually prove it. This must never be populated from a share name, mount path,
+    /// host/IP string, or operator declaration alone.
+    public let qualifiedNetworkStorageIdentifier: String?
     public let basis: String
     public let detail: String?
 
     public init(
         resolutionStatus: StorageTopologyResolutionStatus,
         physicalLeafIdentifiers: [String],
+        qualifiedNetworkStorageIdentifier: String? = nil,
         basis: String,
         detail: String? = nil
     ) {
         self.resolutionStatus = resolutionStatus
         self.physicalLeafIdentifiers = physicalLeafIdentifiers.sorted()
+        self.qualifiedNetworkStorageIdentifier = qualifiedNetworkStorageIdentifier
         self.basis = basis
         self.detail = detail
     }
