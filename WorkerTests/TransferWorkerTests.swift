@@ -677,6 +677,19 @@ final class TransferWorkerTests: XCTestCase {
             physicalLeafIdentifiers: ["physical-1", "physical-2"],
             basis: "synthetic-composite"
         )
+        let qualifiedNAS = StorageIdentityEvidence(
+            resolutionStatus: .resolved,
+            physicalLeafIdentifiers: [],
+            qualifiedNetworkStorageIdentifier: "server-guid:abc|pool:media",
+            basis: "synthetic-qualified-network"
+        )
+
+        XCTAssertEqual(qualifiedNAS.qualifiedNetworkStorageIdentifier, "server-guid:abc|pool:media")
+        // Pairwise PhysicalDeviceRelationship remains intentionally unknown for NAS.
+        // Post Prep consumes the separately qualified server + pool identity; BitMatch
+        // does not relabel a network pool as a physical leaf.
+        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, qualifiedNAS), .unknown)
+        XCTAssertEqual(StorageTopologyClassifier.relationship(qualifiedNAS, qualifiedNAS), .unknown)
 
         XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, physical1), .samePhysicalDevice)
         XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, physical2), .differentPhysicalDevices)
