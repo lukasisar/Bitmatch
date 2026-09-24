@@ -1,4 +1,7 @@
 import Foundation
+#if os(macOS)
+import Darwin
+#endif
 
 /// The legacy runtime was qualified as protocol V3. V4 execution binds this task-local
 /// override only for one validated exact-subset job, allowing the same hardened runtime
@@ -106,6 +109,10 @@ public struct TransferJobSpec: Codable, Equatable, Sendable {
     public let destinations: [DestinationRequest]
     public let verificationPolicy: WorkerVerificationPolicy
     public let requestedCapabilities: [CapabilityRequest]
+    /// Optional kernel-enforced lease path for this exact job + attempt. A caller that
+    /// requires `attempt-lease-v1` must provide an absolute path. The dispatcher acquires
+    /// the lease before any destination media side effect and holds it through the run.
+    public let attemptLeasePath: String?
     /// V4 only. Exact, source-root-relative file set. V3 must omit this field and keeps
     /// its qualified whole-source behavior unchanged.
     public let includeRelativePaths: [String]?
@@ -119,6 +126,7 @@ public struct TransferJobSpec: Codable, Equatable, Sendable {
         destinations: [DestinationRequest],
         verificationPolicy: WorkerVerificationPolicy = .sha256,
         requestedCapabilities: [CapabilityRequest] = [],
+        attemptLeasePath: String? = nil,
         includeRelativePaths: [String]? = nil
     ) {
         self.protocolVersion = protocolVersion
@@ -129,12 +137,13 @@ public struct TransferJobSpec: Codable, Equatable, Sendable {
         self.destinations = destinations
         self.verificationPolicy = verificationPolicy
         self.requestedCapabilities = requestedCapabilities
+        self.attemptLeasePath = attemptLeasePath
         self.includeRelativePaths = includeRelativePaths.map(TransferRelativePathSelection.canonicalized)
     }
 
     private enum CodingKeys: String, CodingKey {
         case protocolVersion, jobID, attemptID, requestedAt, sourceRoot
-        case destinations, verificationPolicy, requestedCapabilities, includeRelativePaths
+        case destinations, verificationPolicy, requestedCapabilities, attemptLeasePath, includeRelativePaths
     }
 
     public init(from decoder: Decoder) throws {
@@ -147,6 +156,7 @@ public struct TransferJobSpec: Codable, Equatable, Sendable {
         destinations = try container.decode([DestinationRequest].self, forKey: .destinations)
         verificationPolicy = try container.decodeIfPresent(WorkerVerificationPolicy.self, forKey: .verificationPolicy) ?? .sha256
         requestedCapabilities = try container.decodeIfPresent([CapabilityRequest].self, forKey: .requestedCapabilities) ?? []
+        attemptLeasePath = try container.decodeIfPresent(String.self, forKey: .attemptLeasePath)
         includeRelativePaths = try container.decodeIfPresent([String].self, forKey: .includeRelativePaths)
             .map(TransferRelativePathSelection.canonicalized)
     }
@@ -476,3 +486,190 @@ public struct TransferWorkerRunResult: Sendable {
         self.diagnostic = diagnostic
     }
 }
+
+
+public struct TransferWorkerAttemptIdentity: Sendable, Equatable {
+    public let jobID: UUID
+    public let attemptID: UUID
+
+    public init(jobID: UUID, attemptID: UUID) {
+        self.jobID = jobID
+        self.attemptID = attemptID
+    }
+}
+
+/// Execution identity used only for hidden worker staging names. It is intentionally
+/// platform-neutral because the shared file-copy services also build for iPad.
+public enum TransferWorkerExecutionContext {
+    @TaskLocal public static var attemptIdentity: TransferWorkerAttemptIdentity?
+    /// Recovery-only opt-in. Normal transfers keep the established rule that a
+    /// matching pre-existing final is degraded because this attempt did not write it.
+    @TaskLocal public static var strengthenReusedExistingDestination = false
+
+    static func makeTemporaryFileName() -> String {
+        guard let identity = attemptIdentity else {
+            return ".bitmatch.tmp." + UUID().uuidString
+        }
+        return temporaryFileName(jobID: identity.jobID, attemptID: identity.attemptID)
+    }
+
+    static func temporaryFileName(
+        jobID: UUID,
+        attemptID: UUID,
+        randomID: UUID = UUID()
+    ) -> String {
+        temporaryFilePrefix(jobID: jobID, attemptID: attemptID)
+            + randomID.uuidString.lowercased()
+    }
+
+    static func temporaryFilePrefix(jobID: UUID, attemptID: UUID) -> String {
+        ".bitmatch.tmp."
+            + jobID.uuidString.lowercased() + "."
+            + attemptID.uuidString.lowercased() + "."
+    }
+
+    static func ownsTemporaryFile(named name: String, jobID: UUID, attemptID: UUID) -> Bool {
+        let prefix = temporaryFilePrefix(jobID: jobID, attemptID: attemptID)
+        guard name.hasPrefix(prefix) else { return false }
+        return UUID(uuidString: String(name.dropFirst(prefix.count))) != nil
+    }
+}
+
+#if os(macOS)
+public enum TransferWorkerAttemptLeaseError: Error, Sendable, Equatable, LocalizedError {
+    case openFailed(Int32)
+    case notRegularFile
+    case alreadyHeld
+    case identityMismatch
+    case readFailed(Int32)
+    case writeFailed(Int32)
+
+    public var errorDescription: String? {
+        switch self {
+        case .openFailed(let code):
+            return "Could not open the attempt lease (errno \(code))."
+        case .notRegularFile:
+            return "The attempt lease is not a regular file."
+        case .alreadyHeld:
+            return "Another process still holds this attempt lease."
+        case .identityMismatch:
+            return "The attempt lease belongs to a different job or attempt."
+        case .readFailed(let code):
+            return "Could not read the attempt lease identity (errno \(code))."
+        case .writeFailed(let code):
+            return "Could not persist the attempt lease identity (errno \(code))."
+        }
+    }
+}
+
+/// Kernel-enforced ownership for one exact transfer job + attempt.
+public final class TransferWorkerAttemptLease: @unchecked Sendable {
+    private let fileDescriptor: Int32
+
+    private init(fileDescriptor: Int32) {
+        self.fileDescriptor = fileDescriptor
+    }
+
+    deinit {
+        _ = flock(fileDescriptor, LOCK_UN)
+        _ = Darwin.close(fileDescriptor)
+    }
+
+    public static func acquire(
+        at url: URL,
+        jobID: UUID,
+        attemptID: UUID
+    ) throws -> TransferWorkerAttemptLease {
+        let descriptor = url.path.withCString {
+            Darwin.open($0, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, mode_t(0o600))
+        }
+        guard descriptor >= 0 else {
+            throw TransferWorkerAttemptLeaseError.openFailed(errno)
+        }
+
+        do {
+            var info = stat()
+            guard fstat(descriptor, &info) == 0 else {
+                throw TransferWorkerAttemptLeaseError.readFailed(errno)
+            }
+            guard (info.st_mode & S_IFMT) == S_IFREG else {
+                throw TransferWorkerAttemptLeaseError.notRegularFile
+            }
+            guard flock(descriptor, LOCK_EX | LOCK_NB) == 0 else {
+                let code = errno
+                if code == EWOULDBLOCK || code == EAGAIN {
+                    throw TransferWorkerAttemptLeaseError.alreadyHeld
+                }
+                throw TransferWorkerAttemptLeaseError.openFailed(code)
+            }
+
+            let expected = identityData(jobID: jobID, attemptID: attemptID)
+            let existing = try readAll(from: descriptor)
+            if existing.isEmpty {
+                try writeIdentity(expected, to: descriptor)
+            } else if existing != expected {
+                throw TransferWorkerAttemptLeaseError.identityMismatch
+            }
+            return TransferWorkerAttemptLease(fileDescriptor: descriptor)
+        } catch {
+            _ = flock(descriptor, LOCK_UN)
+            _ = Darwin.close(descriptor)
+            throw error
+        }
+    }
+
+    public static func identityData(jobID: UUID, attemptID: UUID) -> Data {
+        Data((
+            "bitmatch-attempt-lease-v1\n"
+            + "job=" + jobID.uuidString.lowercased() + "\n"
+            + "attempt=" + attemptID.uuidString.lowercased() + "\n"
+        ).utf8)
+    }
+
+    private static func readAll(from descriptor: Int32) throws -> Data {
+        guard lseek(descriptor, 0, SEEK_SET) == 0 else {
+            throw TransferWorkerAttemptLeaseError.readFailed(errno)
+        }
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        while true {
+            let count = buffer.withUnsafeMutableBytes {
+                Darwin.read(descriptor, $0.baseAddress, $0.count)
+            }
+            if count == 0 { break }
+            if count < 0 {
+                if errno == EINTR { continue }
+                throw TransferWorkerAttemptLeaseError.readFailed(errno)
+            }
+            result.append(contentsOf: buffer.prefix(Int(count)))
+        }
+        return result
+    }
+
+    private static func writeIdentity(_ data: Data, to descriptor: Int32) throws {
+        guard ftruncate(descriptor, 0) == 0,
+              lseek(descriptor, 0, SEEK_SET) == 0 else {
+            throw TransferWorkerAttemptLeaseError.writeFailed(errno)
+        }
+        try data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            var written = 0
+            while written < raw.count {
+                let count = Darwin.write(
+                    descriptor,
+                    base.advanced(by: written),
+                    raw.count - written
+                )
+                if count < 0, errno == EINTR { continue }
+                guard count > 0 else {
+                    throw TransferWorkerAttemptLeaseError.writeFailed(errno)
+                }
+                written += count
+            }
+        }
+        guard fsync(descriptor) == 0 else {
+            throw TransferWorkerAttemptLeaseError.writeFailed(errno)
+        }
+    }
+}
+#endif

@@ -67,7 +67,7 @@ private final class FanOutTemporaryWriter {
         self.parentFD = try target.root.openOrCreateDirectory(at: Array(relativeComponents.dropLast()))
         self.filename = relativeComponents[relativeComponents.count - 1]
         self.destinationPath = target.root.destinationURL(for: relativeComponents.joined(separator: "/")).path
-        self.temporaryName = ".bitmatch.tmp." + UUID().uuidString
+        self.temporaryName = TransferWorkerExecutionContext.makeTemporaryFileName()
         do {
             self.temporaryFD = try PinnedDestinationDirectory.createTemporaryFile(
                 named: temporaryName,
@@ -517,10 +517,27 @@ extension FileCopyService {
         durabilityRecorder?.recordReadbackFacts(facts, destinationPath: destinationPath)
 
         let destinationChecksum = hasher.finalize().map { String(format: "%02x", $0) }.joined()
+        let matches = referenceSHA256 == destinationChecksum
+        if matches,
+           copyFacts?.reusedExistingDestination == true,
+           TransferWorkerExecutionContext.strengthenReusedExistingDestination {
+            var strengthenedFacts = copyFacts ?? TransferCopyDurabilityFacts(
+                reusedExistingDestination: true,
+                sourceRemainedStable: true
+            )
+            let strengthened = try destination.strengthenDurability(using: durabilityIO)
+            strengthenedFacts.strengthenedExistingDestination = true
+            strengthenedFacts.fullSync = strengthened.fullSync
+            strengthenedFacts.directorySync = strengthened.directorySync
+            durabilityRecorder?.recordCopyFacts(
+                strengthenedFacts,
+                destinationPath: destinationPath
+            )
+        }
         return VerificationResult(
             sourceChecksum: referenceSHA256,
             destinationChecksum: destinationChecksum,
-            matches: referenceSHA256 == destinationChecksum,
+            matches: matches,
             checksumType: .sha256,
             processingTime: Date().timeIntervalSince(startedAt),
             fileSize: expectedSize
