@@ -8,17 +8,29 @@ public enum StorageTopologyResolutionStatus: String, Codable, Equatable, Sendabl
 public struct StorageIdentityEvidence: Codable, Equatable, Sendable {
     public let resolutionStatus: StorageTopologyResolutionStatus
     public let physicalLeafIdentifiers: [String]
+    /// Stable NAS/server identity, when a resolver can actually prove it.
+    /// Share names, mount paths, host/IP strings, and operator declarations are not
+    /// sufficient. Post Prep uses this identity for "one NAS is one copy" cardinality.
+    public let qualifiedNetworkServerIdentifier: String?
+    /// Stable storage-pool identity within the qualified NAS/server. This binds a later
+    /// storage proof to the same stored copy, but does not create another independent
+    /// copy when one server exposes multiple pools or shares.
+    public let qualifiedNetworkStoragePoolIdentifier: String?
     public let basis: String
     public let detail: String?
 
     public init(
         resolutionStatus: StorageTopologyResolutionStatus,
         physicalLeafIdentifiers: [String],
+        qualifiedNetworkServerIdentifier: String? = nil,
+        qualifiedNetworkStoragePoolIdentifier: String? = nil,
         basis: String,
         detail: String? = nil
     ) {
         self.resolutionStatus = resolutionStatus
         self.physicalLeafIdentifiers = physicalLeafIdentifiers.sorted()
+        self.qualifiedNetworkServerIdentifier = qualifiedNetworkServerIdentifier
+        self.qualifiedNetworkStoragePoolIdentifier = qualifiedNetworkStoragePoolIdentifier
         self.basis = basis
         self.detail = detail
     }

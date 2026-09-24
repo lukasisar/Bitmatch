@@ -677,6 +677,30 @@ final class TransferWorkerTests: XCTestCase {
             physicalLeafIdentifiers: ["physical-1", "physical-2"],
             basis: "synthetic-composite"
         )
+        let qualifiedNAS = StorageIdentityEvidence(
+            resolutionStatus: .resolved,
+            physicalLeafIdentifiers: [],
+            qualifiedNetworkServerIdentifier: "server-guid:abc",
+            qualifiedNetworkStoragePoolIdentifier: "pool:media",
+            basis: "synthetic-qualified-network"
+        )
+        let sameNASDifferentPool = StorageIdentityEvidence(
+            resolutionStatus: .resolved,
+            physicalLeafIdentifiers: [],
+            qualifiedNetworkServerIdentifier: "server-guid:abc",
+            qualifiedNetworkStoragePoolIdentifier: "pool:archive",
+            basis: "synthetic-qualified-network"
+        )
+
+        XCTAssertEqual(qualifiedNAS.qualifiedNetworkServerIdentifier, "server-guid:abc")
+        XCTAssertEqual(qualifiedNAS.qualifiedNetworkStoragePoolIdentifier, "pool:media")
+        XCTAssertEqual(sameNASDifferentPool.qualifiedNetworkServerIdentifier, qualifiedNAS.qualifiedNetworkServerIdentifier)
+        XCTAssertNotEqual(sameNASDifferentPool.qualifiedNetworkStoragePoolIdentifier, qualifiedNAS.qualifiedNetworkStoragePoolIdentifier)
+        // Pairwise PhysicalDeviceRelationship remains intentionally physical-only for NAS.
+        // Post Prep consumes the separately qualified server and pool dimensions without
+        // relabeling network storage as a physical leaf.
+        XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, qualifiedNAS), .unknown)
+        XCTAssertEqual(StorageTopologyClassifier.relationship(qualifiedNAS, sameNASDifferentPool), .unknown)
 
         XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, physical1), .samePhysicalDevice)
         XCTAssertEqual(StorageTopologyClassifier.relationship(physical1, physical2), .differentPhysicalDevices)
