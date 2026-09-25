@@ -98,6 +98,14 @@ changed, writes the bound job/attempt identity into that lease file, and holds t
 until the worker has finished all destination work. A parent-app crash does not release
 the worker's lock while the worker process is still alive.
 
+The worker writes its identity only into an empty lease file. It refuses (`invalidJob`,
+before any destination file is opened) a lease that another process holds, and a lease
+that holds any other non-empty bytes than its exact identity. Post Prep relies on this
+to retire an abandoned attempt: when it starts that copy over, it replaces the identity
+with its own retirement fence while holding the lock, so a late worker for the retired
+attempt is refused even after Post Prep releases the lock
+(`testV4WorkerRefusesARetiredLeaseBeforeAnyDestinationWrite`).
+
 Worker-owned media staging files created under that execution are named:
 
 ```text

@@ -119,6 +119,45 @@ final class TransferWorkerV4Tests: XCTestCase {
         ) == true)
     }
 
+    /// Post Prep #142 relies on this: after "Start this copy over" it leaves a retirement
+    /// fence (any non-empty bytes other than the worker identity) in the abandoned
+    /// attempt's lease. A late worker for that attempt must refuse before it touches any
+    /// destination, and must leave the fence unchanged.
+    func testV4WorkerRefusesARetiredLeaseBeforeAnyDestinationWrite() async throws {
+        let jobID = UUID(uuidString: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")!
+        let attemptID = UUID(uuidString: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb")!
+        let leaseURL = root.appendingPathComponent("retired-attempt.lease")
+        let fence = Data((
+            "postprep-retired-attempt-v1\n"
+            + "job=" + jobID.uuidString.lowercased() + "\n"
+            + "attempt=" + attemptID.uuidString.lowercased() + "\n"
+        ).utf8)
+        try fence.write(to: leaseURL)
+        let job = TransferJobSpec(
+            protocolVersion: 4,
+            jobID: jobID,
+            attemptID: attemptID,
+            requestedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sourceRoot: source.path,
+            destinations: [destination("a", destinationA)],
+            verificationPolicy: .sha256,
+            requestedCapabilities: [
+                CapabilityRequest(name: TransferWorkerDispatcher.exactSubsetCapability, required: true),
+                CapabilityRequest(name: TransferWorkerDispatcher.attemptLeaseCapability, required: true),
+            ],
+            attemptLeasePath: leaseURL.path,
+            includeRelativePaths: ["DCIM/NEW001.MP4"]
+        )
+        let evidenceURL = root.appendingPathComponent("retired.json")
+        let result = await TransferWorkerDispatcher().run(job: job, evidenceURL: evidenceURL)
+
+        XCTAssertEqual(result.exitCode, .invalidJob)
+        XCTAssertNil(result.evidence)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: destinationA.path), [])
+        XCTAssertFalse(FileManager.default.fileExists(atPath: evidenceURL.path))
+        XCTAssertEqual(try Data(contentsOf: leaseURL), fence)
+    }
+
     func testV4RecoveryCanStrengthenAMatchingExistingFinalWithoutRewritingIt() async throws {
         let selected = ["DCIM/NEW001.MP4"]
         let first = await TransferWorkerDispatcher().run(
