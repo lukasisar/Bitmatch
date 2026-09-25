@@ -417,7 +417,13 @@ public struct TransferWorkerRuntime {
                 try await SafetyValidator.performSafetyChecks(
                     source: sourceURL,
                     destinations: destinationURLs,
-                    sourceSizeBytes: totalBytes
+                    sourceSizeBytes: totalBytes,
+                    bytesToWrite: try SafetyValidator.bytesStillToWrite(
+                        manifest: manifest,
+                        source: sourceURL,
+                        destinations: destinationURLs,
+                        settings: settings
+                    )
                 )
             } catch {
                 if let typedError = Self.typedPreflightError(for: error, job: job) {

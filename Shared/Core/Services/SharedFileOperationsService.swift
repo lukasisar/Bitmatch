@@ -498,10 +498,20 @@ class SharedFileOperationsService: FileOperationsService {
             settings: operation.settings
         )
 
+        // Finals an earlier copy already left at their exact paths are reused or
+        // refused, never written again, so they need no new space.
+        let bytesToWrite = try SafetyValidator.bytesStillToWrite(
+            manifest: sourceManifest,
+            source: operation.sourceURL,
+            destinations: operation.destinationURLs,
+            settings: operation.settings
+        )
+
         try await SafetyValidator.performSafetyChecks(
             source: operation.sourceURL,
             destinations: operation.destinationURLs,
-            sourceSizeBytes: manifestBytes
+            sourceSizeBytes: manifestBytes,
+            bytesToWrite: bytesToWrite
         )
 
         let perSourceFileCount = sourceManifest.count
@@ -516,15 +526,16 @@ class SharedFileOperationsService: FileOperationsService {
         // Step 2a: Validate sufficient storage space
         for (index, destinationURL) in operation.destinationURLs.enumerated() {
             let available = fileSystem.freeSpace(at: destinationURL)
-            SharedLogger.debug("Storage check dest #\(index+1): need \(totalSizeBytes), have \(available)", category: .transfer)
+            let destinationBytes = min(totalSizeBytes, bytesToWrite[index])
+            SharedLogger.debug("Storage check dest #\(index+1): need \(destinationBytes), have \(available)", category: .transfer)
             
             // Add 100MB buffer for overhead/filesystem structures
             let requiredSizeBytes = try SafetyValidator.checkedRequiredSpace(
-                sourceBytes: totalSizeBytes,
+                sourceBytes: destinationBytes,
                 headroomBytes: 100 * 1024 * 1024
             )
             if available < requiredSizeBytes {
-                throw BitMatchError.insufficientStorage(totalSizeBytes, available)
+                throw BitMatchError.insufficientStorage(destinationBytes, available)
             }
         }
 

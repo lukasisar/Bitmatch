@@ -8,10 +8,14 @@ final class SafetyValidator {
 
     // MARK: - Pre-Operation Safety Checks
 
+    /// `bytesToWrite`, when given, holds per destination (same order) the bytes the copy
+    /// still has to write there; see `bytesStillToWrite`. Without it every destination
+    /// must hold the whole `sourceSizeBytes`.
     static func performSafetyChecks(
         source: URL,
         destinations: [URL],
-        sourceSizeBytes: Int64
+        sourceSizeBytes: Int64,
+        bytesToWrite: [Int64]? = nil
     ) async throws {
         // Validate source exists and is accessible
         guard FileManager.default.fileExists(atPath: source.path) else {
@@ -38,7 +42,11 @@ final class SafetyValidator {
         }
 
         // Check for sufficient space
-        try await validateAvailableSpace(sourceSizeBytes: sourceSizeBytes, destinations: destinations)
+        try await validateAvailableSpace(
+            sourceSizeBytes: sourceSizeBytes,
+            destinations: destinations,
+            bytesToWrite: bytesToWrite
+        )
 
         SharedLogger.info("Safety checks passed for \(destinations.count) destinations", category: .transfer)
     }
@@ -98,13 +106,19 @@ final class SafetyValidator {
         }
     }
 
-    private static func validateAvailableSpace(sourceSizeBytes: Int64, destinations: [URL]) async throws {
-        let requiredSpace = try checkedRequiredSpace(
-            sourceBytes: sourceSizeBytes,
-            headroomBytes: 1_000_000_000
-        )
-
-        for destination in destinations {
+    private static func validateAvailableSpace(
+        sourceSizeBytes: Int64,
+        destinations: [URL],
+        bytesToWrite: [Int64]?
+    ) async throws {
+        if let bytesToWrite, bytesToWrite.count != destinations.count {
+            throw FileOperationError.unsafeOperation("Capacity plan does not match the destinations")
+        }
+        for (index, destination) in destinations.enumerated() {
+            let requiredSpace = try checkedRequiredSpace(
+                sourceBytes: bytesToWrite?[index] ?? sourceSizeBytes,
+                headroomBytes: 1_000_000_000
+            )
             let availableSpace = getAvailableSpace(at: destination)
 
             guard availableSpace > requiredSpace else {
@@ -451,6 +465,47 @@ final class SafetyValidator {
             return importantUsage
         }
         return Int64(standardCapacity ?? 0)
+    }
+
+    /// Per destination (same order), the bytes of `manifest` the copy still has to write
+    /// under the root it resolves for `settings`.
+    ///
+    /// A manifest file whose exact destination path already holds a regular file of the
+    /// same size needs no new space: the copy never writes over an existing final. It
+    /// reuses that file after a full checksum match, or refuses it as a conflict. This is
+    /// what an interrupted or abandoned earlier copy typically left behind. Anything else
+    /// at that path (nothing, a different size, a symbolic link, a folder) still counts.
+    /// Read-only: `lstat` only, nothing is opened or created.
+    static func bytesStillToWrite(
+        manifest: [FileEntry],
+        source: URL,
+        destinations: [URL],
+        settings: CameraLabelSettings
+    ) throws -> [Int64] {
+        try destinations.map { destination in
+            let root = try resolvedDestinationRootChecked(
+                source: source,
+                destination: destination,
+                settings: settings
+            )
+            var total: Int64 = 0
+            for entry in manifest {
+                let size = max(0, entry.size)
+                var info = stat()
+                let path = root.appendingPathComponent(entry.relativePath).path
+                if lstat(path, &info) == 0,
+                   (info.st_mode & S_IFMT) == S_IFREG,
+                   Int64(info.st_size) == size {
+                    continue
+                }
+                let (sum, overflow) = total.addingReportingOverflow(size)
+                guard !overflow else {
+                    throw FileOperationError.unsafeOperation("Source size exceeds the supported range")
+                }
+                total = sum
+            }
+            return total
+        }
     }
 
     static func checkedRequiredSpace(sourceBytes: Int64, headroomBytes: Int64) throws -> Int64 {

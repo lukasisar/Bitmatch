@@ -138,3 +138,14 @@ operations remain degraded; a mismatch or unsafe path remains a failure.
 
 This capability is recovery evidence for the current bytes. It does not rewrite the
 history or claim that the abandoned attempt itself succeeded.
+
+## Capacity preflight counts only bytes still to write
+
+Before reading or writing media, the worker checks every destination's free space
+against the selected bytes plus its safety headroom. A selected file whose exact
+destination path already holds a regular file of the same size is left out of that
+sum: the worker never writes over an existing final, it reuses a matching one after a
+full checksum and refuses a different one as a conflict, so that file needs no new
+space. Anything else at that path (nothing, a different size, a symbolic link) still
+counts. This lets a retry or a recovery after an interrupted copy fit on a drive that
+already holds most of the copy (Post Prep #142).
